@@ -850,6 +850,7 @@ private:
 	__attribute__((noinline)) static bool runXELPMemoryStage(IOService *that, IOPCIDevice *provider);
 	__attribute__((noinline)) static bool configureAlderLakeNWithGT(IOService *that, IOPCIDevice *provider, IOMemoryMap *map, bool &released);
 	bool tglAcceleratorRequested {false}, tglAcceleratorReady {false};
+	bool tglSkipGPUTicks {false}; // -wex-skip-gputicks: return 0 for GPU_TICKS (0x2910) reads.
 	mach_vm_address_t orgTGLAcceleratorProbe {}, orgTGLAcceleratorFailure {};
 	mach_vm_address_t orgTGLAcceleratorRegister {}, orgTGLAcceleratorStatusMemory {}, orgTGLAcceleratorEngine {};
 	static IOService *wrapTGLAcceleratorProbe(IOService *that, IOService *provider, SInt32 *score);
