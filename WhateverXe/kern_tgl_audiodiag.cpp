@@ -70,9 +70,13 @@ bool audioSerialize(void *,void *,OSSerialize *serializer) {
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
-// -wex-audio-wake. WEXTGLAudioWake: {version, stage, before, afterSet, afterRestore, setNs, restoreNs}
+// -wex-audio-wake. WEXTGLAudioWake: {version 2, stage, before, afterSet, afterRestore, setNs, restoreNs,
+//  reasserts, firstReassertNs, lastReassertNs, holdTicks}
+// After the pulse, bit 15 is re-checked every 10 ms for 10 s and set again if something
+// (Apple's framebuffer init) cleared it, so the override survives until the HDA link reset.
 // stage: 4 = pulsed from processKernel, 3 = restored, 8 = no BAR0 map, 9 = register reads all-ones.
-uint32_t wakeOrig;uint64_t wakeRec[7] {1};thread_call_t wakeRestoreCall;
+uint32_t wakeOrig;uint64_t wakeRec[11] {2};thread_call_t wakeRestoreCall,wakeHoldCall;
+constexpr uint64_t holdTicksMax=1000; // 1000 x 10 ms = 10 s
 void wakePublish() {IORegistryEntry::getRegistryRoot()->setProperty("WEXTGLAudioWake",wakeRec,sizeof(wakeRec));}
 void wakeRestore(thread_call_param_t,thread_call_param_t) {
  if(!gpuBase)return;
@@ -80,6 +84,20 @@ void wakeRestore(thread_call_param_t,thread_call_param_t) {
  *reg=(*reg&~(1U<<15))|(wakeOrig&(1U<<15));
  wakeRec[1]=3;wakeRec[4]=*reg;uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&wakeRec[6]);
  wakePublish();
+}
+uint64_t nowNs() {uint64_t t,ns;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&ns);return ns;}
+void wakeHold(thread_call_param_t,thread_call_param_t) {
+ if(!gpuBase)return;
+ auto reg=reinterpret_cast<volatile uint32_t *>(gpuBase+0x65F10);
+ const auto v=*reg;
+ if(v!=UINT32_MAX && !(v&(1U<<15))) {
+  *reg=v|(1U<<15);
+  const auto ns=nowNs();if(!wakeRec[7])wakeRec[8]=ns;wakeRec[9]=ns;++wakeRec[7];
+  wakePublish();
+ }
+ if(++wakeRec[10]<holdTicksMax) {
+  uint64_t deadline;clock_interval_to_deadline(10,NSEC_PER_MSEC,&deadline);thread_call_enter_delayed(wakeHoldCall,deadline);
+ } else wakePublish();
 }
 void audioWake() {
  if(!gpuBase) {wakeRec[1]=8;wakePublish();return;}
@@ -90,6 +108,8 @@ void audioWake() {
  *reg=(*reg)|(1U<<15);IODelay(1000);
  wakeRec[1]=4;wakeRec[3]=*reg;uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&wakeRec[5]);
  wakePublish();
+ wakeHoldCall=thread_call_allocate(wakeHold,nullptr);
+ if(wakeHoldCall) {uint64_t d;clock_interval_to_deadline(10,NSEC_PER_MSEC,&d);thread_call_enter_delayed(wakeHoldCall,d);}
  wakeRestoreCall=thread_call_allocate(wakeRestore,nullptr);
  uint64_t deadline;clock_interval_to_deadline(300,NSEC_PER_SEC,&deadline);
  if(wakeRestoreCall)thread_call_enter_delayed(wakeRestoreCall,deadline);
