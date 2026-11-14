@@ -4382,6 +4382,8 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
     return ready;
 }
 
+void tglAudioDiagEarly(IOPCIDevice *gpu); // kern_tgl_audiodiag.cpp
+bool tglAudioProbeInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
@@ -4390,6 +4392,7 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// (0x2910) read hangs the machine with a machine check. The donor treats 0 as "no sample".
 	tglSkipGPUTicks=checkKernelArgument("-wex-skip-gputicks");
 	IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeSkipGPUTicks",tglSkipGPUTicks);
+	if(!xeProfile.mobileDisplay13())tglAudioDiagEarly(physicalGPU); // -wex-audio-diag / -wex-audio-wake only
     // ADLP_LOAD_ONLY_KERNEL: do not enter TGL MMIO/FIA, bootstrap or VM setup.
     const auto physicalEntry=XELP::deviceEntry(xeProfile.identity);
     adlpLoadOnly=physicalEntry && xeProfile.mobileDisplay13() &&
@@ -12587,6 +12590,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		if (currentFramebuffer->loadIndex == index) {
 			if (modDVMTCalcFix.enabled && modDVMTCalcFix.available)
 				modDVMTCalcFix.processFramebufferKext(patcher, index, address, size);
+			tglAudioProbeInstall(patcher, index, address, size); // -wex-audio-diag / -wex-audio-wake only
    // Exact donor transaction entries. Each installed wrapper arbitrates
    // immediately; TC-cold admission additionally requires the accelerator
    // direct-store route as well as the display-side routes.
