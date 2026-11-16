@@ -8,6 +8,7 @@
 #include "kern_xelp_device.hpp"
 #include "kern_xe_data_access.hpp"
 #include "kern_backlight_profile.hpp"
+#include "kern_hdmi_audio.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_iokit.hpp>
 #include <IOKit/pci/IOPCIDevice.h>
@@ -34,6 +35,15 @@ static const char *backlightPath[] { "/System/Library/Extensions/AppleBacklight.
 static KernelPatcher::KextInfo backlight { "com.apple.driver.AppleBacklight",backlightPath,arrsize(backlightPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 static const char *surfacePath[] { "/System/Library/Extensions/IOSurface.kext/Contents/MacOS/IOSurface" };
 static KernelPatcher::KextInfo surface { "com.apple.iokit.IOSurface",surfacePath,arrsize(surfacePath),{true},{},KernelPatcher::KextInfo::Unloaded };
+// -wex-hdmi-audio: AppleHDA is linked at runtime by SimpleHDA (macOS 26) or loaded from SLE.
+static const char *hdaControllerPath[] {
+ "/EFI/OC/Kexts/SimpleHDA.kext/Contents/Resources/Payload/AppleHDA.kext/Contents/PlugIns/AppleHDAController.kext/Contents/MacOS/AppleHDAController",
+ "/System/Library/Extensions/AppleHDA.kext/Contents/PlugIns/AppleHDAController.kext/Contents/MacOS/AppleHDAController" };
+static KernelPatcher::KextInfo hdaController { "com.apple.driver.AppleHDAController",hdaControllerPath,arrsize(hdaControllerPath),{true},{},KernelPatcher::KextInfo::Unloaded };
+static const char *hdaMainPath[] {
+ "/EFI/OC/Kexts/SimpleHDA.kext/Contents/Resources/Payload/AppleHDA.kext/Contents/MacOS/AppleHDA",
+ "/System/Library/Extensions/AppleHDA.kext/Contents/MacOS/AppleHDA" };
+static KernelPatcher::KextInfo hdaMain { "com.apple.driver.AppleHDA",hdaMainPath,arrsize(hdaMainPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 void XeHost::init() {
  callbackHost=this;
  // Copy the firmware tables while the boot firmware still owns them. This
@@ -46,6 +56,7 @@ void XeHost::init() {
  lilu.onKextLoadForce(&accelFamily);
  lilu.onKextLoadForce(&backlight);
  lilu.onKextLoadForce(&surface);
+ if(WEXHDMIAudio::requested()) {lilu.onKextLoadForce(&hdaController);lilu.onKextLoadForce(&hdaMain);}
  xe.init();
  XeDataAccess::init();
 }
@@ -132,6 +143,8 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   processKernel(patcher);
  }
  if(!active)return;
+ if(hdaController.loadIndex==index) {WEXHDMIAudio::processController(patcher,index,address,size);return;}
+ if(hdaMain.loadIndex==index) {WEXHDMIAudio::processMain(patcher,index,address,size);return;}
  if(xe.isIntelProvider(index)) {
   // Donor imports exist before their native start, but Lilu's already-loaded
   // kmod walk need not notify their provider first. Resolve its exports before

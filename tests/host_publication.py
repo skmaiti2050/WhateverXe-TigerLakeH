@@ -87,6 +87,8 @@ namespace XeDataAccess {
 struct Graphics:KernelPatcher::KextInfo {Graphics(size_t i=4){loadIndex=i;id="com.apple.iokit.IOGraphicsFamily";}bool off=false;void switchOff(){off=true;}} graphics;
 KernelPatcher::KextInfo surface{"com.apple.iokit.IOSurface",6},backlight{"com.apple.driver.AppleBacklight",5},accelFamily{"com.apple.iokit.IOAcceleratorFamily2",7},kextAppleIntelTGLCompat{"org.b00t0x.AppleIntelTGLCompat",3};
 KernelPatcher::KextInfo kextIntelTGL{"com.apple.driver.AppleIntelTGLGraphics",2},kextIntelTGLFb{"com.apple.driver.AppleIntelTGLGraphicsFramebuffer",1};
+KernelPatcher::KextInfo hdaController{"com.apple.driver.AppleHDAController",99},hdaMain{"com.apple.driver.AppleHDA",98};
+namespace WEXHDMIAudio {bool requested(){return false;}bool processController(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}bool processMain(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}}
 using IOSimpleLock=int;int scopeLock=0;uintptr_t fakeThread=1;
 IOSimpleLock *IOSimpleLockAlloc(){return &scopeLock;}
 int IOSimpleLockLockDisableInterrupt(IOSimpleLock*){return 0;}
