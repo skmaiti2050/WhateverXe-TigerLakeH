@@ -44,6 +44,7 @@ WEX_HDA_STUB(handler,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54
 WEX_HDA_STUB(edid,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38)
 WEX_HDA_STUB(cgstart,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x28)
 WEX_HDA_STUB(engpstart,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x58)
+WEX_HDA_STUB(reset,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38)
 
 namespace {
 void publish(const char *key,const void *bytes,unsigned length) {
@@ -150,6 +151,7 @@ const HookSpec hookSpecs[] {
  {"__ZN18AppleHDAController19edidIsValidForAudioEP6OSDatai",pro17_38,sizeof(pro17_38),wexHdaStub_edid,&wexHdaRet_edid},
  {"__ZN20AppleHDACodecGeneric5startEP9IOService",pro17_28,sizeof(pro17_28),wexHdaStub_cgstart,&wexHdaRet_cgstart},
  {"__ZN14AppleHDAEngine23performAudioEngineStartEv",pro17_58,sizeof(pro17_58),wexHdaStub_engpstart,&wexHdaRet_engpstart},
+ {"__ZN18AppleHDAController20resetAudioControllerEbb",pro17_38,sizeof(pro17_38),wexHdaStub_reset,&wexHdaRet_reset},
 };
 // WEXHDMIAudioHooks: {attempts, then per attempt: 1 hooked | 2 symbol missing | 3 prologue mismatch | 4 write failed}.
 uint64_t hookRec[9];
@@ -578,6 +580,33 @@ IOReturn wrapFBEvent(void *self,void *ref,IOService *fb,int event,void *info) {
  return ret;
 }
 
+// ---- 1b. Codec wake right before AppleHDA's link reset (TGL) ----------------
+// On TGL-H Apple's framebuffer starts after processKernel and keeps rewriting
+// 0x65F10, so an early wake is gone by the time AppleHDA resets the link and reads
+// STATESTS. Re-assert AUDIO_PIN_BUF_CTL bit 31 and pulse the codec-wake override
+// immediately before every resetAudioController, keeping bit 15 set through it.
+// WEXHDMIAudioResetWake: {calls, 0x65F10 before, after set, after reset, return,
+//  AUDIO_PIN_BUF_CTL after set, bool args (a | b<<8)}.
+mach_vm_address_t orgReset;
+uint32_t resetRec[7];
+uint32_t wrapReset(void *self,bool a,bool b) {
+ resetRec[0]++;resetRec[6]=static_cast<uint32_t>(a)|(static_cast<uint32_t>(b)<<8);
+ volatile uint32_t *reg=nullptr;
+ if(wakeBase) {
+  auto buf=reinterpret_cast<volatile uint32_t *>(wakeBase+0x48414);
+  if(*buf!=UINT32_MAX)*buf=*buf|0x80000000U;resetRec[5]=*buf;
+  reg=reinterpret_cast<volatile uint32_t *>(wakeBase+0x65F10);
+  resetRec[1]=*reg;
+  if(resetRec[1]!=UINT32_MAX) {*reg=resetRec[1]&~(1U<<15);IODelay(1000);*reg=(*reg)|(1U<<15);IODelay(1000);}
+  resetRec[2]=*reg;
+ }
+ const auto r=FunctionCast(wrapReset,orgReset)(self,a,b);
+ if(reg)resetRec[3]=*reg;
+ resetRec[4]=r;
+ publish("WEXHDMIAudioResetWake",resetRec,sizeof(resetRec));
+ return r;
+}
+
 // ---- 7. Stream binding at playback start ------------------------------------
 // Linux hdmi_init_pin / hdmi_setup_audio_infoframe: select the streaming
 // converter on the connected pin, enable pin output, unmute, set the channel count
@@ -670,6 +699,7 @@ bool WEXHDMIAudio::processController(KernelPatcher &patcher,size_t index,mach_vm
  bool ok=execCmdFn!=0;
  ok=hookAddress(patcher,index,address,size,"__ZN18AppleHDAController23framebufferEventHandlerEPvP13IOFramebufferiS0_",reinterpret_cast<void *>(wrapFBEvent),orgFBEvent) && ok;
  ok=hookAddress(patcher,index,address,size,"__ZN18AppleHDAController19edidIsValidForAudioEP6OSDatai",reinterpret_cast<void *>(wrapEdidValid),orgEdidValid) && ok;
+ ok=hookAddress(patcher,index,address,size,"__ZN18AppleHDAController20resetAudioControllerEbb",reinterpret_cast<void *>(wrapReset),orgReset) && ok;
  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDMIAudioControllerReady",ok);
  return ok;
 }
