@@ -11324,7 +11324,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
    if(base[i]=='E' && !memcmp(base+i,f,sizeof(f))) {rec[0]++;site=base+i;}
   if(rec[0]==1) {
    KernelPatcher::LookupPatch patch {currentGraphics,f,r,sizeof(f),1};
-   patcher.applyLookupPatch(&patch,const_cast<uint8_t *>(site),sizeof(f));
+   patcher.applyLookupPatch(&patch,const_cast<uint8_t *>(site),sizeof(f)+1); // Lilu needs the window larger than the pattern (as in #163)
    rec[1]=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,r,sizeof(r));
   }
   patcher.clearError();
