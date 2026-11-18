@@ -602,9 +602,25 @@ uint32_t pulseWake() {
 // WEXHDMIAudioResetWake (v3, 64-bit): {calls, ns, PWR_WELL_CTL1, PWR_WELL_CTL2, 0x65F10 before,
 //  after our set, after reset, return, AUDIO_PIN_BUF_CTL, args a|b<<8} for the LAST call;
 //  WEXHDMIAudioResetFirst: same layout for the FIRST call.
+// v4: AppleHDA's first link reset on TGL-H runs ~5 s before Apple's hwEnableAudio
+// powers the audio domain (wells 0x3 at reset, 0x3f at hwEnableAudio). If the TGL
+// framebuffer hook is installed, hold the reset until hwEnableAudio has run (max 20 s).
+// WEXHDMIAudioResetWait: {ms waited, 1 hwEnableAudio seen | 2 timed out | 3 not waited}.
+volatile bool hwEnableDone;
+bool tglFBHooked;
+uint64_t waitRec[2];
 mach_vm_address_t orgReset;
 uint64_t resetRec[10],resetFirst[10];
 uint32_t wrapReset(void *self,bool a,bool b) {
+ if(!waitRec[1]) {
+  if(tglFBHooked && !hwEnableDone) {
+   uint32_t ms=0;
+   while(!hwEnableDone && ms<20000) {IOSleep(100);ms+=100;}
+   if(hwEnableDone)IOSleep(200);
+   waitRec[0]=ms;waitRec[1]=hwEnableDone ? 1 : 2;
+  } else waitRec[1]=3;
+  publish("WEXHDMIAudioResetWait",waitRec,sizeof(waitRec));
+ }
  resetRec[0]++;resetRec[1]=nowNs();resetRec[2]=rd(0x45400);resetRec[3]=rd(0x45404);
  resetRec[4]=rd(0x65F10);resetRec[5]=pulseWake();resetRec[8]=rd(0x48414);
  resetRec[9]=static_cast<uint64_t>(a)|(static_cast<uint64_t>(b)<<8);
@@ -629,6 +645,7 @@ uint64_t wrapHwEnable(void *ctrl,void *fb,void *path) {
  hwRec[3]=rd(0x45400);hwRec[4]=rd(0x45404);hwRec[6]=rd(0x65F10);
  hwRec[7]=pulseWake();hwRec[8]=rd(0x48414);hwRec[9]=rd(0x650C0);
  publish("WEXHDMIAudioHwEnable",hwRec,sizeof(hwRec));
+ hwEnableDone=true;
  return r;
 }
 
@@ -722,6 +739,7 @@ bool WEXHDMIAudio::processTGLFramebuffer(KernelPatcher &patcher,size_t index,mac
  KernelPatcher::RouteRequest route {"__ZN31AppleIntelFramebufferController13hwEnableAudioEP21AppleIntelFramebufferP21AppleIntelDisplayPath",wrapHwEnable,orgHwEnable};
  const bool ok=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDMIAudioTGLFBReady",ok);
+ tglFBHooked=ok;
  uint64_t ns=nowNs();publish("WEXHDMIAudioTGLFBLoadNs",&ns,sizeof(ns));
  return ok;
 }
