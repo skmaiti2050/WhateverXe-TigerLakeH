@@ -11308,6 +11308,28 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
+ // -wex-noccs (opt-in, from b00t0x/WhateverXe#163): keep compute off the Compute Command
+ // Streamer. Apple's Info.plist sets EnableMultiContext=1; TGL PRM Vol14 "SVSM: Dual Context -
+ // Invalidate hang" requires CCS and RCS never run in parallel, and i915 never uses the CCS on
+ // Gen12 LP. Rename the only lookup of the key (populateAccelConfig) so it reads its code
+ // default 0 ("Multi-Context (Compute Command Streamer) Disabled!"). Matched by content, and
+ // only if the NUL-terminated key occurs exactly once in the image.
+ // WhateverXeNoCCS: {occurrences, patched}.
+ if(checkKernelArgument("-wex-noccs") && currentGraphics) {
+  static const uint8_t f[]="EnableMultiContext",r[]="EnableMultiContexX";
+  uint32_t rec[2] {};
+  auto base=reinterpret_cast<const uint8_t *>(address);
+  const uint8_t *site=nullptr;
+  for(size_t i=0;size>=sizeof(f) && i<=size-sizeof(f);i++)
+   if(base[i]=='E' && !memcmp(base+i,f,sizeof(f))) {rec[0]++;site=base+i;}
+  if(rec[0]==1) {
+   KernelPatcher::LookupPatch patch {currentGraphics,f,r,sizeof(f),1};
+   patcher.applyLookupPatch(&patch,const_cast<uint8_t *>(site),sizeof(f));
+   rec[1]=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,r,sizeof(r));
+  }
+  patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeNoCCS",rec,sizeof(rec));
+ }
  // Framebuffer-only mode must never enter the donor accelerator probe.
  // The bring-up payload omits this bundle; also reject it if already present.
  if (!tglAcceleratorRequested) {
