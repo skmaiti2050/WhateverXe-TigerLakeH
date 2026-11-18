@@ -12599,6 +12599,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		if (currentFramebuffer->loadIndex == index) {
 			if (modDVMTCalcFix.enabled && modDVMTCalcFix.available)
 				modDVMTCalcFix.processFramebufferKext(patcher, index, address, size);
+			WEXHDMIAudio::processTGLFramebuffer(patcher, index, address, size); // -wex-hdmi-audio only
    // Exact donor transaction entries. Each installed wrapper arbitrates
    // immediately; TC-cold admission additionally requires the accelerator
    // direct-store route as well as the display-side routes.

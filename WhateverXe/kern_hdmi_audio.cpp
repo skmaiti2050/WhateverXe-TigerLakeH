@@ -587,23 +587,48 @@ IOReturn wrapFBEvent(void *self,void *ref,IOService *fb,int event,void *info) {
 // immediately before every resetAudioController, keeping bit 15 set through it.
 // WEXHDMIAudioResetWake: {calls, 0x65F10 before, after set, after reset, return,
 //  AUDIO_PIN_BUF_CTL after set, bool args (a | b<<8)}.
+uint64_t nowNs() {uint64_t t,ns;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&ns);return ns;}
+uint32_t rd(uint32_t off) {return wakeBase ? *reinterpret_cast<volatile uint32_t *>(wakeBase+off) : UINT32_MAX;}
+// Re-assert AUDIO_PIN_BUF_CTL bit 31 and pulse 0x65F10 bit 15 (left set). Returns 0x65F10 after.
+uint32_t pulseWake() {
+ if(!wakeBase)return UINT32_MAX;
+ auto buf=reinterpret_cast<volatile uint32_t *>(wakeBase+0x48414);
+ if(*buf!=UINT32_MAX)*buf=*buf|0x80000000U;
+ auto reg=reinterpret_cast<volatile uint32_t *>(wakeBase+0x65F10);
+ const uint32_t v=*reg;
+ if(v!=UINT32_MAX) {*reg=v&~(1U<<15);IODelay(1000);*reg=(*reg)|(1U<<15);IODelay(1000);}
+ return *reg;
+}
+// WEXHDMIAudioResetWake (v3, 64-bit): {calls, ns, PWR_WELL_CTL1, PWR_WELL_CTL2, 0x65F10 before,
+//  after our set, after reset, return, AUDIO_PIN_BUF_CTL, args a|b<<8} for the LAST call;
+//  WEXHDMIAudioResetFirst: same layout for the FIRST call.
 mach_vm_address_t orgReset;
-uint32_t resetRec[7];
+uint64_t resetRec[10],resetFirst[10];
 uint32_t wrapReset(void *self,bool a,bool b) {
- resetRec[0]++;resetRec[6]=static_cast<uint32_t>(a)|(static_cast<uint32_t>(b)<<8);
- volatile uint32_t *reg=nullptr;
- if(wakeBase) {
-  auto buf=reinterpret_cast<volatile uint32_t *>(wakeBase+0x48414);
-  if(*buf!=UINT32_MAX)*buf=*buf|0x80000000U;resetRec[5]=*buf;
-  reg=reinterpret_cast<volatile uint32_t *>(wakeBase+0x65F10);
-  resetRec[1]=*reg;
-  if(resetRec[1]!=UINT32_MAX) {*reg=resetRec[1]&~(1U<<15);IODelay(1000);*reg=(*reg)|(1U<<15);IODelay(1000);}
-  resetRec[2]=*reg;
- }
+ resetRec[0]++;resetRec[1]=nowNs();resetRec[2]=rd(0x45400);resetRec[3]=rd(0x45404);
+ resetRec[4]=rd(0x65F10);resetRec[5]=pulseWake();resetRec[8]=rd(0x48414);
+ resetRec[9]=static_cast<uint64_t>(a)|(static_cast<uint64_t>(b)<<8);
  const auto r=FunctionCast(wrapReset,orgReset)(self,a,b);
- if(reg)resetRec[3]=*reg;
- resetRec[4]=r;
+ resetRec[6]=rd(0x65F10);resetRec[7]=r;
+ if(resetRec[0]==1){memcpy(resetFirst,resetRec,sizeof(resetRec));publish("WEXHDMIAudioResetFirst",resetFirst,sizeof(resetFirst));}
  publish("WEXHDMIAudioResetWake",resetRec,sizeof(resetRec));
+ return r;
+}
+
+// ---- 1c. TGL: wake from inside Apple's hwEnableAudio -------------------------
+// jkbuha (#124): if the audio well is down at AppleHDA's reset, try the wake while
+// the framebuffer has the domain up, i.e. right after its own hwEnableAudio.
+// WEXHDMIAudioHwEnable: {calls, first ns, last ns, PWR_WELL_CTL1, PWR_WELL_CTL2,
+//  0x65F10 before, after original, after our wake, AUDIO_PIN_BUF_CTL, AUD_PIN_ELD_CP_VLD}.
+mach_vm_address_t orgHwEnable;
+uint64_t hwRec[10];
+uint64_t wrapHwEnable(void *ctrl,void *fb,void *path) {
+ hwRec[0]++;const auto t=nowNs();if(hwRec[0]==1)hwRec[1]=t;hwRec[2]=t;
+ hwRec[5]=rd(0x65F10);
+ const auto r=FunctionCast(wrapHwEnable,orgHwEnable)(ctrl,fb,path);
+ hwRec[3]=rd(0x45400);hwRec[4]=rd(0x45404);hwRec[6]=rd(0x65F10);
+ hwRec[7]=pulseWake();hwRec[8]=rd(0x48414);hwRec[9]=rd(0x650C0);
+ publish("WEXHDMIAudioHwEnable",hwRec,sizeof(hwRec));
  return r;
 }
 
@@ -689,6 +714,15 @@ bool WEXHDMIAudio::processFramebuffer(KernelPatcher &patcher,size_t index,mach_v
  KernelPatcher::RouteRequest route {"__ZN21AppleIntelFramebuffer21setupDisplayResourcesEv",wrapSetupRes,orgSetupRes};
  const bool ok=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
  IORegistryEntry::getRegistryRoot()->setProperty("WEXHDMIAudioFBReady",ok);
+ return ok;
+}
+
+bool WEXHDMIAudio::processTGLFramebuffer(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(orgHwEnable || !requested())return false;
+ KernelPatcher::RouteRequest route {"__ZN31AppleIntelFramebufferController13hwEnableAudioEP21AppleIntelFramebufferP21AppleIntelDisplayPath",wrapHwEnable,orgHwEnable};
+ const bool ok=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHDMIAudioTGLFBReady",ok);
+ uint64_t ns=nowNs();publish("WEXHDMIAudioTGLFBLoadNs",&ns,sizeof(ns));
  return ok;
 }
 

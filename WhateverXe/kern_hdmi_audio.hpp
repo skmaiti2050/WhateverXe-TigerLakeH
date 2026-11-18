@@ -13,6 +13,8 @@ void wakeEarly(IOPCIDevice *gpu);
 void wakeFramebuffer(volatile uint8_t *mmio);
 // AppleIntel*Framebuffer image: setupDisplayResources audio flag.
 bool processFramebuffer(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
+// TGL (non-display13) framebuffer: route hwEnableAudio for the in-domain codec wake.
+bool processTGLFramebuffer(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 // AppleHDAController and AppleHDA images (linked at runtime by SimpleHDA on Tahoe).
 bool processController(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
 bool processMain(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
