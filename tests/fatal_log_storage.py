@@ -39,7 +39,7 @@ int main() {
  for(char c:guc.bytes.guc.detail)assert(c==0);
  for(char c:guc.bytes.guc.boundary)assert(c==0);
  for(char c:guc.bytes.guc.preStart)assert(c==0);
- static_assert(sizeof(log.bytes.csb)==4600 && sizeof(log.bytes.guc)==3440,"preserve diagnostic capacity");
+ static_assert(sizeof(log.bytes.csb)==5800 && sizeof(log.bytes.guc)==3440,"preserve diagnostic capacity"); // +1200 CSB witness (#203)
  puts("PASS fatal storage: one of 16 concurrent owners, no reentry, preserved capacities and first record");
 }
 '''
