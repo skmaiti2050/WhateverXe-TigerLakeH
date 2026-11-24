@@ -17287,17 +17287,12 @@ void XE::wrapTGLHostCSB(void *streamer,uint32_t *entry,uint32_t *index) {
 
 // Both routes run only AFTER the native validator has rejected list state.
 // Preserve failure, enriching the persisted panic rather than suppressing it.
-static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *failedStreamer) {
- if(!tglFatalLogStorage.claim())PANIC("igfx","concurrent CSB fatal: %s entry=%x:%x",reason,entry?entry[1]:0,entry?entry[0]:0);
- uint64_t before=0,writes=0,immediate=0,finalBad=0;
- for (uint32_t i=0;i<tglHost.maps && i<arrsize(tglHost.map);++i) {
-  const auto &r=tglHost.map[i];if (!__atomic_load_n(&r.ready,__ATOMIC_ACQUIRE)) continue;
-  before+=r.q[5];writes+=r.q[10];immediate+=r.q[11];finalBad+=r.q[12];
- }
- auto &trail=tglFatalLogStorage.bytes.csb.trail;size_t used=0;uint32_t kept=0;uint64_t streamer=reinterpret_cast<uintptr_t>(failedStreamer);
- // Preserve the exact currently dispatched native entry ahead of the old boot
- // history. Match pointer AND thread, not a guessed engine or a stale slot.
+// #203 witness capture, split out of tglHostCSBFatal so neither kernel stack frame
+// exceeds the 2 KiB budget. Fills the witness text; when the dispatched entry is
+// found it also returns that entry's streamer through *streamerOut.
+static __attribute__((noinline)) void tglHostCSBFatalWitness(const uint32_t *entry,uint64_t *streamerOut) {
  auto &witnessText=tglFatalLogStorage.bytes.csb.witness;
+ uint64_t streamer=*streamerOut;
  {
   using namespace TGLS0Evidence;
   Receipt receipt;bool found=false;
@@ -17322,6 +17317,21 @@ static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *faile
    __atomic_load_n(&tglS0Epoch,__ATOMIC_ACQUIRE),__atomic_load_n(&tglS0WakeCount,__ATOMIC_ACQUIRE),
    tglS0Timeline.at(SleepEnter),tglS0Timeline.at(SleepExit),tglS0Timeline.at(WakeEnter),tglS0Timeline.at(WakeExit),tglS0Timeline.at(Power0Enter),tglS0Timeline.at(Power0Exit),tglS0Timeline.at(Power2Enter),tglS0Timeline.at(Power2Exit),tglS0Timeline.at(BridgeSleepEnter),tglS0Timeline.at(BridgeSleepExit),tglS0Timeline.at(CaptureEnter),tglS0Timeline.at(CaptureExit),tglS0Timeline.at(IRQDisableEnter),tglS0Timeline.at(IRQDisableExit),tglS0Timeline.at(IRQEnableEnter),tglS0Timeline.at(IRQEnableExit),e<6?tglS0Timeline.at(ResetEnter0+e):0,e<6?tglS0Timeline.at(ResetExit0+e):0);
  }
+ *streamerOut=streamer;
+}
+
+static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *failedStreamer) {
+ if(!tglFatalLogStorage.claim())PANIC("igfx","concurrent CSB fatal: %s entry=%x:%x",reason,entry?entry[1]:0,entry?entry[0]:0);
+ uint64_t before=0,writes=0,immediate=0,finalBad=0;
+ for (uint32_t i=0;i<tglHost.maps && i<arrsize(tglHost.map);++i) {
+  const auto &r=tglHost.map[i];if (!__atomic_load_n(&r.ready,__ATOMIC_ACQUIRE)) continue;
+  before+=r.q[5];writes+=r.q[10];immediate+=r.q[11];finalBad+=r.q[12];
+ }
+ auto &trail=tglFatalLogStorage.bytes.csb.trail;size_t used=0;uint32_t kept=0;uint64_t streamer=reinterpret_cast<uintptr_t>(failedStreamer);
+ // Preserve the exact currently dispatched native entry ahead of the old boot
+ // history (tglHostCSBFatalWitness).
+ auto &witnessText=tglFatalLogStorage.bytes.csb.witness;
+ tglHostCSBFatalWitness(entry,&streamer);
  // Locate this failure's streamer, then retain its history across interrupt
  // threads. Fixed records are read only here, after the native fatal decision.
  for (uint32_t i=tglHost.csbs<arrsize(tglHost.csb) ? tglHost.csbs : arrsize(tglHost.csb);i && kept<6;--i) {
