@@ -10,6 +10,152 @@ constexpr uint32_t Capacity = 12;
 constexpr uint32_t ResetIndex = Capacity - 1;
 constexpr uint64_t Sentinel = UINT64_MAX;
 
+// The hardware write pointer is separate from the driver's consumed head.
+// A wake can preserve the CSB only when the idle tail and software head are
+// unchanged from the observed pre-sleep state. No queue entries are dropped.
+enum class WakeAction : uint8_t { Initialize, Preserve, RearmAndInitialize };
+// CPU-side ownership proof across the early IRQ-off -> system sleep -> wake
+// interval. The native streamer provides serialization of its actual queues;
+// these counters only reject a sample if another native operation intervenes.
+struct Activity {
+    uint64_t revision {};
+    uint32_t busy {};
+    void change() { __atomic_add_fetch(&revision,1ULL,__ATOMIC_ACQ_REL); }
+    uint64_t version() const { return __atomic_load_n(&revision,__ATOMIC_ACQUIRE); }
+    bool stable(uint64_t expected) const {
+        return !__atomic_load_n(&busy,__ATOMIC_ACQUIRE) && version()==expected;
+    }
+};
+struct ActivityScope {
+    Activity *activity {};
+    explicit ActivityScope(Activity *a=nullptr,bool changes=false) { enter(a,changes); }
+    void enter(Activity *a,bool changes) {
+        activity=a;
+        if(a) { __atomic_add_fetch(&a->busy,1U,__ATOMIC_ACQ_REL); if(changes)a->change(); }
+    }
+    ~ActivityScope() { if(activity)__atomic_sub_fetch(&activity->busy,1U,__ATOMIC_RELEASE); }
+    ActivityScope(const ActivityScope &)=delete;
+    ActivityScope &operator=(const ActivityScope &)=delete;
+};
+// A candidate is produced while the native bridge still owns powered MMIO.
+// Only its exact bridge may claim it once, and only after that bridge is off.
+// Enable invalidates an unclaimed candidate, not an already bound snapshot.
+struct SleepCandidate {
+    enum Phase : uint64_t { Idle, Capturing, Canceled, Ready, Claiming, ClaimCanceled };
+    static constexpr uint64_t PhaseMask=7;
+    uint64_t state {}; // ticket in upper bits, phase in low three bits
+    uintptr_t bridge {};
+    uint32_t begin(uintptr_t b) {
+        if(!b)return 0;
+        auto old=__atomic_load_n(&state,__ATOMIC_ACQUIRE);
+        for(;;) {
+            const auto phase=old&PhaseMask;
+            if(phase!=Idle && phase!=Ready)return 0;
+            const uint32_t n=static_cast<uint32_t>(old>>3)+1;
+            if(!n)return 0; // never reuse a wrapped ticket
+            const uint64_t next=(static_cast<uint64_t>(n)<<3)|Capturing;
+            if(__atomic_compare_exchange_n(&state,&old,next,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&bridge,b,__ATOMIC_RELEASE);return n;
+            }
+        }
+    }
+    void publish(uintptr_t b,uint32_t n) {
+        if(!b || !n || __atomic_load_n(&bridge,__ATOMIC_ACQUIRE)!=b)return;
+        const uint64_t token=static_cast<uint64_t>(n)<<3;
+        auto expected=token|Capturing;
+        if(!__atomic_compare_exchange_n(&state,&expected,token|Ready,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE) && expected==(token|Canceled))
+            __atomic_compare_exchange_n(&state,&expected,token|Idle,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+    }
+    // Only the canonical native bridge calls this. Cancel a concurrent writer
+    // or adopter without releasing its exclusive receipt access prematurely.
+    void invalidate(uintptr_t b) {
+        if(!b)return;
+        auto old=__atomic_load_n(&state,__ATOMIC_ACQUIRE);
+        for(;;) {
+            const auto phase=old&PhaseMask;
+            if(phase!=Ready && phase!=Capturing && phase!=Claiming)return;
+            if(phase!=Capturing && __atomic_load_n(&bridge,__ATOMIC_ACQUIRE)!=b)return;
+            const auto next=(old&~PhaseMask)|(phase==Capturing?Canceled:phase==Claiming?ClaimCanceled:Idle);
+            if(__atomic_compare_exchange_n(&state,&old,next,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
+        }
+    }
+    uint32_t claim(uintptr_t b,bool disabled) {
+        auto old=__atomic_load_n(&state,__ATOMIC_ACQUIRE);
+        if(!b || (old&PhaseMask)!=Ready || __atomic_load_n(&bridge,__ATOMIC_ACQUIRE)!=b)return 0;
+        const auto next=(old&~PhaseMask)|(disabled?Claiming:Idle);
+        if(!__atomic_compare_exchange_n(&state,&old,next,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return 0;
+        return disabled?static_cast<uint32_t>(old>>3):0;
+    }
+    bool completeClaim(uint32_t n) {
+        if(!n)return false;
+        const uint64_t token=static_cast<uint64_t>(n)<<3;
+        auto expected=token|Claiming;
+        if(__atomic_compare_exchange_n(&state,&expected,token|Idle,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return true;
+        if(expected==(token|ClaimCanceled))__atomic_compare_exchange_n(&state,&expected,token|Idle,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+        return false;
+    }
+};
+inline bool emptyBanks(const uintptr_t (&slots)[4]) {
+    return !(slots[0] || slots[1] || slots[2] || slots[3]);
+}
+
+struct WakeBaseline {
+    uint32_t pointer {}, tail {}, head {}, active {};
+    bool valid {};
+};
+struct WakePlan {
+    WakeAction action {WakeAction::Initialize};
+    bool restoreMode {};
+};
+constexpr bool hasCSB12Mode(uint32_t mode) {
+    return mode != UINT32_MAX && (mode & 8);
+}
+constexpr WakePlan planMode(uint32_t mode, uint32_t modeAtInit) {
+    if (mode == UINT32_MAX || hasCSB12Mode(mode))
+        return {WakeAction::Initialize, false};
+    return {WakeAction::RearmAndInitialize, hasCSB12Mode(modeAtInit)};
+}
+inline WakePlan planWake(const WakeBaseline &prior, uint32_t pointer,
+                         uint32_t tail, uint32_t mode,
+                         uint32_t softwareHead, uint32_t active,
+                         uint32_t modeAtInit) {
+    const auto modePlan=planMode(mode,modeAtInit);
+    if (modePlan.action==WakeAction::RearmAndInitialize ||
+        mode==UINT32_MAX)
+        return modePlan;
+    if (pointer == UINT32_MAX)
+        return {WakeAction::Initialize, false};
+    const uint32_t write = pointer & 0xF;
+    if (!prior.valid || write >= Capacity || tail >= Capacity ||
+        softwareHead >= Capacity || pointer != prior.pointer ||
+        write != prior.tail || write != tail ||
+        write != softwareHead || softwareHead != prior.head ||
+        active != prior.active)
+        return {WakeAction::Initialize, false};
+    return {WakeAction::Preserve, false};
+}
+
+// Use the same tail source as the normal CSB drain. In MMIO-tail mode the
+// indexed write pointer is authoritative; HWSP+0xBC is not the live tail.
+template<class IO>
+uint32_t readTail(IO &io) {
+    if (!io.mmioTail)
+        return io.readHWSPLastWrite();
+    io.acquire();
+    return io.readMMIOPointer() & 0xF;
+}
+
+// GFX_MODE uses a masked write. Re-arm only when the last successful
+// initialization proved that bit 3 was enabled, then verify the readback.
+template<class IO>
+bool ensureCSB12Mode(const WakePlan &plan, IO &io, uint32_t &modeAfter) {
+    if (plan.restoreMode) {
+        io.writeMode(0x00080008U);
+        modeAfter = io.readMode();
+    }
+    return hasCSB12Mode(modeAfter);
+}
+
 // Mask only the Gen11+ read/write fields defined in intel_lrc_reg.h.
 // r92's broad 0xffff mask also cleared bits15:12 (observed 7 -> 0),
 // after which HWSP and indexed-MMIO events appeared one slot apart.
@@ -148,7 +294,12 @@ inline Handler handlerFor(const Event &event) {
 	return Handler::Invalid;
 }
 
-enum class Error : uint8_t { None, NotInitialized, InvalidPointer, Unavailable, Rejected };
+enum class Error : uint8_t { None, NotInitialized, InvalidPointer, Unavailable, Rejected, ResetMismatch };
+// Native submitExecList returns void: an unready CSB12 queue has no valid
+// completion/error path at this call boundary, so it must not be submitted.
+constexpr bool canSubmit(bool hardwareReady, Error error) {
+    return hardwareReady && error == Error::None;
+}
 enum class Source : uint8_t { HWSP, RetriedHWSP, MMIO };
 
 struct Sample {
@@ -183,6 +334,12 @@ void initialize(State &state, IO &io) {
 	io.resetPointers(ResetIndex);
 	state.head = ResetIndex;
 	state.error = Error::None;
+}
+
+// An S0 fallback reset is not proof of GPU reset. Confirm the two documented
+// pointer nibbles and the CPU-initialized HWSP tail before admitting work.
+constexpr bool resetMatches(uint32_t pointer,uint32_t hwspTail) {
+    return pointer!=UINT32_MAX && (pointer&0x0F0FU)==((ResetIndex<<8)|ResetIndex) && hwspTail==ResetIndex;
 }
 
 // IO readEntry is one aligned 64-bit HWSP load. nowNs is monotonic; delayUs(1)

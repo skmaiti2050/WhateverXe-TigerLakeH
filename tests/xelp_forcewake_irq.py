@@ -8,7 +8,7 @@ p=argparse.ArgumentParser();p.add_argument('--donor',type=pathlib.Path);a=p.pars
 s=(r/'WhateverXe/kern_xe.cpp').read_text()
 start=s.index('void xelpRegularForceWakeProtected(');end=s.index('bool xelpForceWakeIRQSerialize',start);body=s[start:end]
 # Regression: a shared wrapper must actually be routed for TGL, not only ADL-N.
-route=s[s.index(' const char *wake[]'):s.index(' // r107:',s.index(' const char *wake[]'))]
+route=s[s.index(' const char *wake[]'):s.index(' if (ok && checkKernelArgument("-wex-tgl-s0-csb-resync"))',s.index(' const char *wake[]'))]
 assert 'if(ok) {' in route and 'if(ok && adlnDetected)' not in route
 assert 'protect {wake[0],xelpRegularForceWakeProtected,xelpRegularForceWakeOriginal}' in route
 assert 'WhateverXeForceWakeIRQProtected' in route
@@ -18,7 +18,22 @@ assert 'tglCSBForceWake[0](renderWakeOwner,false,1)' in s
 if a.donor is None:
  print('PASS: common TGL/ADL-N routing and exact-entry guards; use --donor for native reentry execution')
  sys.exit(0)
-data=a.donor.read_bytes();assert hashlib.sha256(data).hexdigest() in ['890735a93a19d3ddda24ff31bda3075dbd145fb7b26c11769f33c4564a8027ac','bd1a21f5e622aadabdab6441f6b5c38ed73fa3053c783fdf0fb7e4b309f273d0']
+data=a.donor.read_bytes()
+donor_sha=hashlib.sha256(data).hexdigest()
+# Sequoia 24H232 / Graphics 0.4.4 (x86_64), confirmed by nm, otool and
+# Ghidra: the counted forcewake entry and the two intercepted call sites
+# retain the exact ABI/instructions used by this native reentry replay.
+sequoia24h232='6c8ab6cce50b9529679ee4fdf5b1c37d091677d945076f41cb4b7f8196c51449'
+qualified={
+ '890735a93a19d3ddda24ff31bda3075dbd145fb7b26c11769f33c4564a8027ac',
+ 'bd1a21f5e622aadabdab6441f6b5c38ed73fa3053c783fdf0fb7e4b309f273d0',
+ sequoia24h232,
+}
+assert donor_sha in qualified, 'unqualified accelerator donor SHA256: '+donor_sha
+if donor_sha==sequoia24h232:
+ assert data[0x28c9a:0x28c9f]==bytes.fromhex('e800000000')
+ assert data[0x28e14:0x28e19]==bytes.fromhex('e900000000')
+ assert data[0x2da26:0x2da2a]==bytes.fromhex('554889e5')
 prologue=bytes.fromhex('554889e541574156415541545350');assert data[0x28c2a:0x28c2a+len(prologue)]==prologue
 prefix=r'''
 #include <cstdint>

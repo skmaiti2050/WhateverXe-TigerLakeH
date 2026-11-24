@@ -55,6 +55,138 @@ static void fresh(State &state, IO &io) {
 	io.writes = 0;
 }
 
+struct TailSourceIO {
+    bool mmioTail {};
+    uint32_t hwspTail {}, mmioPointer {};
+    unsigned acquireCalls {}, hwspReads {}, mmioReads {};
+    void acquire() { ++acquireCalls; }
+    uint32_t readHWSPLastWrite() { ++hwspReads; return hwspTail; }
+    uint32_t readMMIOPointer() { ++mmioReads; return mmioPointer; }
+};
+
+struct ModeIO {
+    uint32_t mode {}, writes {}, lastWrite {};
+    bool latchWrite {true};
+    void writeMode(uint32_t value) {
+        ++writes; lastWrite=value;
+        if (latchWrite) {
+            const uint32_t mask=value>>16;
+            mode=(mode&~mask)|(value&mask);
+        }
+    }
+    uint32_t readMode() { return mode; }
+};
+
+static void sleepCandidateTests() {
+    SleepCandidate c;
+    const uintptr_t a=0x1000,b=0x2000;
+    auto t=c.begin(a);assert(t&&c.begin(a)==0);c.publish(a,t);
+    assert(c.claim(b,true)==0&&c.claim(a,true)==t&&c.claim(a,true)==0);
+    assert(!c.begin(a)&&c.completeClaim(t)&&!c.claim(a,true));
+    t=c.begin(a);c.invalidate(a);assert(c.begin(a)==0);c.publish(a,t);assert(!c.claim(a,true));
+    t=c.begin(a);c.publish(a,t);c.invalidate(b);assert(c.claim(a,true)==t&&c.completeClaim(t));
+    t=c.begin(a);c.publish(a,t);c.invalidate(a);assert(!c.claim(a,true));
+    t=c.begin(a);c.publish(a,t);assert(!c.claim(a,false)&&!c.claim(a,true));
+    t=c.begin(a);c.publish(a,t);auto next=c.begin(a);assert(next>t);c.publish(a,t);assert(!c.claim(a,true));c.publish(a,next);assert(c.claim(a,true)==next&&c.completeClaim(next));
+    t=c.begin(a);c.publish(a,t);assert(c.claim(a,true)==t);c.invalidate(a);assert(!c.begin(a)&&!c.completeClaim(t));
+    next=c.begin(a);assert(next>t);c.publish(a,next);assert(c.claim(a,true)==next&&c.completeClaim(next));
+    Activity activity;auto version=activity.version();assert(activity.stable(version));
+    {ActivityScope read(&activity);assert(!activity.stable(version));}assert(activity.stable(version));
+    {ActivityScope outer(&activity,true);auto v=activity.version();{ActivityScope nested(&activity,true);assert(!activity.stable(v));}assert(!activity.stable(activity.version()));}
+    assert(!activity.stable(version)&&activity.stable(activity.version()));
+    assert(resetMatches(0x8b0b,11)&&resetMatches(0x0b0b,11));
+    assert(!resetMatches(0x8b08,11)&&!resetMatches(0x880b,11)&&!resetMatches(UINT32_MAX,11)&&!resetMatches(0x8b0b,8));
+    assert(!canSubmit(false,Error::ResetMismatch)&&!canSubmit(true,Error::ResetMismatch));
+}
+
+static void wakeTailSourceTests() {
+    TailSourceIO hwsp;
+    hwsp.hwspTail=9; hwsp.mmioPointer=0x0000000B;
+    assert(readTail(hwsp)==9);
+    assert(hwsp.hwspReads==1 && hwsp.mmioReads==0 && hwsp.acquireCalls==0);
+
+    TailSourceIO mmio;
+    mmio.mmioTail=true; mmio.hwspTail=4; mmio.mmioPointer=0x0000090B;
+    assert(readTail(mmio)==0xB);
+    assert(mmio.hwspReads==0 && mmio.mmioReads==1 && mmio.acquireCalls==1);
+}
+
+static void wakeTests() {
+    // A failed 12-entry mode guard must never be treated as a valid
+    // native void submit or GPU-reset resubmission.
+    assert(canSubmit(true,Error::None));
+    assert(!canSubmit(false,Error::None));
+    for(auto error : {Error::NotInitialized,Error::InvalidPointer,
+                      Error::Unavailable,Error::Rejected})
+        assert(!canSubmit(true,error));
+    const WakeBaseline before{0x00000909, 9, 9, 1, true};
+    const WakeBaseline noSnapshot{};
+
+    // Every initialization entry point must verify the mode, including retries
+    // reached from submit after a previous wake could not re-arm GFX_MODE.
+    const auto initializedMode=planMode(0x8,UINT32_MAX);
+    assert(initializedMode.action==WakeAction::Initialize && !initializedMode.restoreMode);
+    const auto retryRearm=planMode(0x0,0x8);
+    assert(retryRearm.action==WakeAction::RearmAndInitialize && retryRearm.restoreMode);
+    ModeIO retry; uint32_t retryMode=0;
+    assert(ensureCSB12Mode(retryRearm,retry,retryMode));
+    assert(retry.writes==1 && retryMode==8);
+    const auto retryUnknown=planMode(0x0,UINT32_MAX);
+    assert(retryUnknown.action==WakeAction::RearmAndInitialize && !retryUnknown.restoreMode);
+    ModeIO blockedRetry; retryMode=0;
+    assert(!ensureCSB12Mode(retryUnknown,blockedRetry,retryMode));
+    assert(blockedRetry.writes==0);
+    const auto invalidMode=planMode(UINT32_MAX,0x8);
+    assert(invalidMode.action==WakeAction::Initialize && !invalidMode.restoreMode);
+    ModeIO invalid; retryMode=UINT32_MAX;
+    assert(!ensureCSB12Mode(invalidMode,invalid,retryMode));
+    assert(invalid.writes==0);
+
+    auto plan=planWake(before, 0x00000909, 9, 0x8, 9, 1, 0x8);
+    assert(plan.action==WakeAction::Preserve && !plan.restoreMode);
+    assert(planWake(before, 0x00000809, 9, 0x8, 9, 1, 0x8).action==WakeAction::Initialize);
+    assert(planWake(before, 0x0000090A, 10, 0x8, 9, 1, 0x8).action==WakeAction::Initialize);
+    assert(planWake(before, 0x00000909, 8, 0x8, 9, 1, 0x8).action==WakeAction::Initialize);
+    assert(planWake(before, 0x00000909, 9, 0x8, 8, 1, 0x8).action==WakeAction::Initialize);
+    assert(planWake(before, 0x00000909, 9, 0x8, 9, 0, 0x8).action==WakeAction::Initialize);
+    assert(planWake(noSnapshot, 0, 0, 0x8, 0, 0, 0x8).action==WakeAction::Initialize);
+    assert(planWake(before, UINT32_MAX, 9, 0x8, 9, 1, 0x8).action==WakeAction::Initialize);
+    assert(planWake(before, 0x00000909, 9, UINT32_MAX, 9, 1, 0x8).action==WakeAction::Initialize);
+
+    // A missing sleep baseline must not suppress mode restoration when the
+    // last successful initialization confirmed GFX_MODE bit 3.
+    const auto rearm=planWake(noSnapshot, 0x00000909, 9, 0x0, 9, 1, 0x8);
+    assert(rearm.action==WakeAction::RearmAndInitialize && rearm.restoreMode);
+    ModeIO restored; restored.mode=0xA5A50002U; uint32_t modeAfter=0;
+    assert(ensureCSB12Mode(rearm,restored,modeAfter));
+    assert(restored.writes==1 && restored.lastWrite==0x00080008U &&
+           modeAfter==0xA5A5000AU);
+
+    // A failed readback is not treated as a successful re-arm.
+    ModeIO failed; failed.latchWrite=false; modeAfter=0;
+    assert(!ensureCSB12Mode(rearm,failed,modeAfter));
+    assert(failed.writes==1 && modeAfter==0);
+
+    // Never invent a prior 12-entry mode when initialization did not prove it.
+    const auto unknown=planWake(noSnapshot,0x00000909,9,0x0,9,1,UINT32_MAX);
+    assert(unknown.action==WakeAction::RearmAndInitialize && !unknown.restoreMode);
+    ModeIO unknownMode; modeAfter=0;
+    assert(!ensureCSB12Mode(unknown,unknownMode,modeAfter));
+    assert(unknownMode.writes==0);
+
+    const auto disabled=planWake(noSnapshot,0x00000909,9,0x0,9,1,0x0);
+    assert(!disabled.restoreMode);
+    ModeIO disabledMode; modeAfter=0;
+    assert(!ensureCSB12Mode(disabled,disabledMode,modeAfter));
+    assert(disabledMode.writes==0);
+
+    // If the register already reports the 12-entry mode, no masked write is needed.
+    const auto already=planWake(noSnapshot,0x00000909,9,0x8,9,1,UINT32_MAX);
+    ModeIO alreadyMode; alreadyMode.mode=8; modeAfter=8;
+    assert(ensureCSB12Mode(already,alreadyMode,modeAfter));
+    assert(alreadyMode.writes==0 && modeAfter==8);
+}
+
 static void eventTests() {
 	const unsigned idle = 0x7FF;
 	auto check = [](unsigned away, unsigned to, bool newQueue, unsigned detail,
@@ -123,6 +255,9 @@ int main(int argc, char **argv) {
 		printf("%08x:%08x\n", entry.identity, entry.flags);
 		return 0;
 	}
+	sleepCandidateTests();
+	wakeTailSourceTests();
+	wakeTests();
 	eventTests();
 	// Model masked-register semantics, including r89's observed 0x7007.
 	// Only documented read/write fields may change. This does not model GPU

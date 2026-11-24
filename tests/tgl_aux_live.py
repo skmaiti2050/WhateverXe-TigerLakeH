@@ -3,7 +3,7 @@
 from pathlib import Path
 import re,subprocess,tempfile
 r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_xe.cpp').read_text()
-bodies='\n'.join(re.search(p,s,re.S).group() for p in [r'static void tglComboAUXDecisionRecord\(uint32_t \*word\) \{.*?\n\}',r'static bool tglComboAUXDecisionSerialize\(void \*,void \*,OSSerialize \*serializer\) \{.*?\n\}',r'void tglAUXRecord\(.*?\n\}',r'static bool tglAUXControlSerialize\(.*?\n\}',r'void tglDPCDRecord\(.*?\n\}',r'static bool tglDPCDSerialize\(.*?\n\}',r'static bool tglAUXLiveSerialize\(.*?\n\}'])
+bodies='\n'.join(re.search(p,s,re.S).group() for p in [r'static void tglComboAUXDecisionRecord\(uint32_t \*word\) \{.*?\n\}',r'static bool tglComboAUXDecisionSerialize\(void \*,void \*,OSSerialize \*serializer\) \{.*?\n\}',r'void tglAUXRecord\(.*?\n\}',r'static bool tglEDPAUXFirstFailureSerialize\(.*?\n\}',r'static bool tglAUXControlSerialize\(.*?\n\}',r'void tglDPCDRecord\(.*?\n\}',r'static bool tglDPCDSerialize\(.*?\n\}',r'static bool tglAUXLiveSerialize\(.*?\n\}'])
 f=r'''#include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +15,8 @@ TGLComboAUXDecision tglComboAUXFirst[64]{},tglComboAUXLast[64]{};uint32_t tglCom
 struct TGLAUXRecord { uint64_t ns,thread;uint32_t word[28]; };
 TGLAUXRecord tglAUXFirst[9][256]{},tglAUXLast[9][128]{},tglAUXControl[9][64]{};
 uint32_t tglAUXCounts[9]{},tglAUXControlCounts[9]{};
+TGLAUXRecord tglEDPAUXFirstFailure{};
+uint32_t tglEDPAUXWakeEpoch{};
 struct TGLDPCDRecord {uint64_t ns,thread;uint32_t word[16];};
 TGLDPCDRecord tglDPCDFirst[1024]{},tglDPCDLast[128]{};
 uint32_t tglDPCDCount{};
@@ -70,6 +72,30 @@ int main(){
   assert(v.word[0]==i*5+1&&v.word[1]==7&&v.word[5]==i&&v.word[7]==i&&v.word[27]==0x4d454d31);
  }
  assert(!tglAUXControlSerialize(nullptr,reinterpret_cast<void*>(9),&s));
+ // First failing DDI0 SOFTWARE witness survives ring eviction, but only
+ // within the most recently marked display wake epoch.
+ config[0]=0;*reinterpret_cast<uint32_t*>(port+0x594)=0x64010;
+ tglEDPAUXWakeEpoch=1;
+ tglAUXRecord(port,14,true,0xe00002d6U,UINT32_MAX,UINT32_MAX,
+              UINT32_MAX,UINT32_MAX,1U,1U,0U,0U);
+ assert(tglEDPAUXFirstFailure.word[1]==14);
+ assert(tglEDPAUXFirstFailure.word[3]==0xe00002d6U);
+ assert(tglEDPAUXFirstFailure.word[10]==1U&&tglEDPAUXFirstFailure.word[11]==1U);
+ assert(tglEDPAUXFirstFailure.word[12]==0U);
+ assert(tglEDPAUXFirstFailure.word[26]==1U);
+ for(unsigned i=0;i<120;++i)tglAUXRecord(port,14,true,0xe00002d8U,
+     UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,2U,2U,0U,0U);
+ assert(tglEDPAUXFirstFailureSerialize(nullptr,nullptr,&s));
+ assert(s.bytes.size()==128);
+ {TGLAUXRecord v;memcpy(&v,s.bytes.data(),128);
+  assert(v.word[3]==0xe00002d6U&&v.word[10]==1U&&v.word[12]==0U&&v.word[26]==1U);}
+ // First-failure snapshot is reset for each FB0 Doze->Wake epoch.
+ tglEDPAUXWakeEpoch=2;tglEDPAUXFirstFailure={};
+ tglAUXRecord(port,14,true,0xe00002d8U,UINT32_MAX,UINT32_MAX,
+              UINT32_MAX,UINT32_MAX,3U,4U,0U,0U);
+ assert(tglEDPAUXFirstFailure.word[3]==0xe00002d8U);
+ assert(tglEDPAUXFirstFailure.word[26]==2U);
+ config[0]=4;*reinterpret_cast<uint32_t*>(port+0x594)=0x64410;
  // DPCD remains visible during quiet training without a publish/return.
  quiet=true;
  tglAUXRecord(port,0,false,0,1,8,0x80010303,0x01010101);

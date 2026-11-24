@@ -21,7 +21,7 @@ display_contract_adapter tgl_agdc_aux_observer xe_data_access adls_aux_parent ad
 adls_clock_guard adls_clock_runtime adls_boot_runtime xelp_mmio_bar bigsur_pmap tahoe_iosurface
 tahoe_pmap sequoia_pmap sonoma_iosurface sonoma_pmap ventura_pmap monterey_pmap xelp_forcewake_irq
 boot_arguments tgl_display_observers tgl_stream_ack tgl_transmitter_observer tgl_transition_live
-tgl_aux_live tgl_bootstrap_host tgl_clock_order provider_binding tgl_start_order tgl_hdmi_wiring
+tgl_aux_live tgl_edp_panel_observer tgl_bootstrap_host tgl_clock_order provider_binding tgl_start_order tgl_hdmi_wiring
 tgl_bootstrap_aux tgl_copy_routing tgl_training_leases tgl_wiring tgl_boot_readout tgl_pcode_gate
 tgl_port_use tgl_tc_cold tgl_fia tgl_port_map tgl_dp_alt_fia tgl_dp_mode_replace
 tgl_phy_clock_gating tgl_probe dvmt compat_exports compat_producer host_publication tgl_power_fuses display13_boot_aux
@@ -38,7 +38,7 @@ display13_retirement display13_trial_retirement display13_port_wait display13_ag
 display13_boot_handoff display13_clock_runtime display13_training_frontend framebuffer_donor_runtime compat_bundle_version dsi_backlight_adapter
 dsi_restart dsi_panel dsi_command_adapter dsi_irq_live dsi_surface_adapter dsi_aperture_adapter
 display13_shutdown display13_wake_notifications released_physical_admission released_topology
-accelerator_resources display13_power_dispatch tgl_recovery test_runner_contract
+accelerator_resources display13_power_dispatch tgl_recovery test_runner_contract tgl_csb_wake_path tgl_csb_install tgl_s0_snapshot_boundary tgl_s0_evidence_routes
 """.split()
 FAMILIES = {'BigSur':'bigsur', 'Monterey':'monterey', 'Ventura':'ventura',
             'Sonoma':'sonoma', 'Sequoia':'sequoia', 'Tahoe':'tahoe'}
@@ -54,7 +54,8 @@ adls_donor adls_clock_native""".split()
 ACCELERATOR_TESTS = """xelp_video_irq adlp_video_route tgl_ccs tgl_completion_cache tgl_cps_color_pipe tgl_ff_dop
 tgl_ff_mode tgl_object_preemption tgl_object_selector tgl_render_flush
 dsi_backing_adapter dsi_backing_native tgl_rpcs_native small_gt_urb
-tgl_tlb_preparser tgl_semaphore_tlb tgl_iosurface_compression tgl_gt2_urb""".split()
+tgl_tlb_preparser tgl_semaphore_tlb tgl_iosurface_compression tgl_gt2_urb
+tgl_native_sleep_abi tgl_s0_irq_boundary""".split()
 
 @dataclass
 class Job:
@@ -78,7 +79,7 @@ def make_jobs(args, root, output):
                          '-fno-omit-frame-pointer','-I'+str(root/'WhateverXe'),str(source),'-o',str(exe)]),
             ('execute', [str(exe)])]))
     for name in PYTHON_TESTS:
-        kind = 'source-lint' if name == 'xelp_forcewake_irq' else 'cpu'
+        kind = 'source-lint' if name in {'xelp_forcewake_irq','tgl_csb_wake_path'} else 'cpu'
         jobs.append(Job(name, kind, [('script', [sys.executable,str(root/'tests'/(name+'.py'))])]))
     for name in DONOR_TESTS:
         command = [sys.executable,str(root/'tests'/(name+'.py'))]
