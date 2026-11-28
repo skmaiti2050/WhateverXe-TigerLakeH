@@ -111,6 +111,7 @@ private:
 	__attribute__((noinline)) bool processDisplay13Framebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	__attribute__((noinline)) bool processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	__attribute__((noinline)) bool processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+	__attribute__((noinline)) void installTGLEDPRefDiagRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	// Separate from generation-selected SKL/ICL patch modules.
 	bool tglRequested {false};
 	bool tglActive {false};
