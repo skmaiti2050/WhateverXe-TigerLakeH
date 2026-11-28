@@ -22,6 +22,10 @@ process=extract('void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags)')
 assert process.index('tglS0Dispatch[io.engine].begin(key,witness)') < process.index('tglCSBMethods[handler](streamer,&entry)') < process.index('tglS0Dispatch[io.engine].complete(key,witness')
 assert 'reinterpret_cast<uintptr_t>(&entry)' in process
 fatal=extract('static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *failedStreamer)')
+# The witness capture lives in a noinline helper (kernel stack budget); check both.
+witnessFn=extract('static __attribute__((noinline)) void tglHostCSBFatalWitness(const uint32_t *entry,uint64_t *streamerOut)')
+assert 'tglHostCSBFatalWitness(entry,&streamer);' in fatal
+fatal=witnessFn+fatal
 assert 'slot.find(reinterpret_cast<uintptr_t>(entry),reinterpret_cast<uintptr_t>(current_thread()),receipt)' in fatal
 assert fatal.index('live={%s}') < fatal.index('trail(early)=%s')
 code=r'''
