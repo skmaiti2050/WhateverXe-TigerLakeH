@@ -14,6 +14,8 @@ int mutex; int *tglAUXLock = &mutex;
 TGLAUXRecord tglAUXFirst[9][256] {}, tglAUXLast[9][128] {};
 uint32_t tglAUXCounts[9] {},tglAUXControlCounts[9] {};
 TGLAUXRecord tglAUXControl[9][64] {};
+TGLAUXRecord tglEDPAUXFirstFailure {};
+uint32_t tglEDPAUXWakeEpoch {};
 bool quiet;
 bool tglQuietTraining() { return quiet; }
 void clock_get_uptime(uint64_t *p) { *p = 42; }

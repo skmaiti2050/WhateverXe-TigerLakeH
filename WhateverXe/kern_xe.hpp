@@ -127,6 +127,9 @@ private:
     bool adlsPLLTableReady {},adlsClockReady {},adlsPowerReady {},adlsPanelPWMReady {};
  XELP::PanelPWM adlsPanelPWM;
  mach_vm_address_t orgADLSLightUpEDP {},orgADLSPanelBacklight {};
+ mach_vm_address_t orgTGLFramebufferWakeEpoch {};
+ static uint32_t wrapTGLFramebufferWakeEpoch(IOService *framebuffer,uint32_t requested);
+
  static bool adlsPanelPWMTarget(void *controller,void *&access,void *&power);
  static bool adlsCapturePanelPWM(void *controller);
  static uint32_t wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void *timing);
@@ -728,6 +731,9 @@ private:
 	mach_vm_address_t tglEnablePG {}, tglDisablePG {}, tglPortByDDI {};
 	mach_vm_address_t orgTGLEnableAUXPower {}, orgTGLDisableAUXPower {};
 	bool tglAUXParentReady {false};
+	// Read-only experimental native AUX/DDI reference receipts on DDI0.
+	// This never changes donor reference counts or touches MMIO.
+	bool tglEDPRefDiagRequested {false};
 	void *tglAUXParentOwner {};
 	// Qualified PHY backends only; immutable while AUX references are live.
 	// Explicit fixed-DP wiring selects the common TC1..6 backend.
@@ -918,7 +924,7 @@ private:
 	static void wrapTGLHostSWInterrupt(void *streamer, void *source, int count);
 	static void wrapTGLHostCSBIDPanic(const uint32_t *entry);
 	static void wrapTGLHostCSB(void *streamer, uint32_t *entry, uint32_t *index);
-	bool installTGLCSB12(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+	bool installTGLCSB12(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size, bool s0IRQEntryQualified);
 	mach_vm_address_t orgTGLCSBInit {}, orgTGLCSBReset {}, orgTGLCSBWake {}, orgTGLCSBProcess {};
 	static bool wrapTGLCSBInit(void *streamer, void *owner, void *loop, void *scheduler, unsigned engine);
 	static void wrapTGLCSBReset(void *streamer);

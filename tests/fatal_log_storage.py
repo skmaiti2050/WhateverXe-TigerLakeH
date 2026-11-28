@@ -23,9 +23,11 @@ int main() {
   if(log.claim()) {
    ++winners;
    for(char c:log.bytes.csb.trail)assert(c==0);
+   for(char c:log.bytes.csb.witness)assert(c==0);
    memset(log.bytes.csb.trail,'T',sizeof(log.bytes.csb.trail));
    memset(log.bytes.csb.vm,'V',sizeof(log.bytes.csb.vm));
    memset(log.bytes.csb.loads,'L',sizeof(log.bytes.csb.loads));
+   memset(log.bytes.csb.witness,'W',sizeof(log.bytes.csb.witness));
    assert(!log.claim()); // Same-thread reentry must never overwrite/wait.
   }
  });
@@ -35,11 +37,15 @@ int main() {
  for(char c:log.bytes.csb.trail)assert(c=='T');
  for(char c:log.bytes.csb.vm)assert(c=='V');
  for(char c:log.bytes.csb.loads)assert(c=='L');
+ for(char c:log.bytes.csb.witness)assert(c=='W');
  TGLFatalLogStorage guc;assert(guc.claim());
  for(char c:guc.bytes.guc.detail)assert(c==0);
  for(char c:guc.bytes.guc.boundary)assert(c==0);
  for(char c:guc.bytes.guc.preStart)assert(c==0);
- static_assert(sizeof(log.bytes.csb)==4600 && sizeof(log.bytes.guc)==3440,"preserve diagnostic capacity");
+ // Preserve all legacy capacities plus the dedicated S0 dispatch/lifecycle witness.
+ static_assert(sizeof(log.bytes.csb.trail)==1800 && sizeof(log.bytes.csb.vm)==1800 &&
+               sizeof(log.bytes.csb.loads)==1000 && sizeof(log.bytes.csb.witness)==1200 &&
+               sizeof(log.bytes.csb)==5800 && sizeof(log.bytes.guc)==3440,"preserve diagnostic capacity");
  puts("PASS fatal storage: one of 16 concurrent owners, no reentry, preserved capacities and first record");
 }
 '''

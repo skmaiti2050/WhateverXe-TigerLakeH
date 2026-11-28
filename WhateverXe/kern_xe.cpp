@@ -101,6 +101,7 @@ void endTGLBootMode(void *path) {
 #include "kern_tgl_start_order.hpp"
 #include "kern_donor.hpp"
 #include "kern_tgl_csb.hpp"
+#include "kern_tgl_s0_evidence.hpp"
 #include "kern_tgl_context_cache.hpp"
 #include "kern_tgl_gsync.hpp"
 #include "kern_tgl_rpcs.hpp"
@@ -154,6 +155,12 @@ static bool tglSameTailEnabled;
 static TGLSameTail::State tglSameTailState{},tglSameTailFailure{};
 static TGLSubmitHistory::History<> tglSubmitHistory;
 static bool tglSameTailSerialize(void *,void *,OSSerialize *);
+namespace {
+static void tglS0InstallEvidence(KernelPatcher &,size_t,mach_vm_address_t,size_t);
+static void tglS0Mark(void *,unsigned);
+static void tglS0InvalidateIRQCandidate(void *);
+static void tglS0ObserveLoad(void *,unsigned,const uint64_t *,bool);
+}
 static bool tglGSYNCReady,tglGSYNCObserveReady;
 static constexpr uint32_t tglTahoeDisabledTrials=31; // 1 completion, 2 indirect, 4 same-tail, 8 GSYNC, 16 RPCS
 static bool tglSameTailRestoreEnabled;
@@ -3433,6 +3440,273 @@ uint32_t tglAUXCounts[9] {};
 // copies software records only; it never enters native mode/power or MMIO.
 TGLAUXRecord tglAUXControl[9][64] {};
 uint32_t tglAUXControlCounts[9] {};
+// Preserves the first failure across a retry-storm ring wrap.
+TGLAUXRecord tglEDPAUXFirstFailure {};
+// Diagnostic receipts never issue a new MMIO access. Native register hooks
+// report the values already read/written by the Apple donor.
+static uint32_t tglEDPAUXWakeEpoch {};
+struct TGLAUXNativeMMIO {
+ uint64_t ns, thread;
+ uint32_t word[8]; // seq, epoch, write(1)/read(0), reg, value, donor RVA, sample, reserved
+};
+static_assert(sizeof(TGLAUXNativeMMIO)==48, "AUX native MMIO receipt");
+static TGLAUXNativeMMIO tglEDPAUXMMIOFirst[64] {}, tglEDPAUXMMIOLast[256] {};
+static uint32_t tglEDPAUXMMIOCount {}, tglEDPAUXMMIOEpochCount {};
+// Sticky first-AUX command identity survives a later native AUX retry storm.
+// Multiple native AUX callers can interleave between DATA1 and SEND.
+/// Keep a bounded per-thread search history rather than one global last writer.
+static TGLAUXNativeMMIO tglEDPAUXRecentData1[16]{},tglEDPAUXFirstData1{},tglEDPAUXFirstCtl{};
+static uint32_t tglEDPAUXRecentData1Count{};
+
+// Separate read-only native panel power and HPD receipts from the high-volume
+// AUX_CTL ring. The native Apple register accessor performs the MMIO operation;
+// this observer never reads any hardware on its own.
+constexpr size_t tglEDPPanelSlots=6;
+static int tglEDPPanelRegisterSlot(unsigned long reg) {
+ switch(reg) {
+  case 0xC7200: return 0; // PP_STATUS
+  case 0xC7204: return 1; // PP_CONTROL
+  case 0xC7208: return 2; // PP_ON_DELAYS
+  case 0xC720C: return 3; // PP_OFF_DELAYS
+  case 0xC4000: return 4; // DDI_A HPD (donor-dependent interpretation)
+  case 0x44470: return 5; // TC HPD status; included to disambiguate port
+  default: return -1;
+ }
+}
+// Keep last native receipt for each PPS/HPD register; freeze it at first AUX SEND.
+static TGLAUXNativeMMIO tglEDPPanelLatest[tglEDPPanelSlots]{};
+static TGLAUXNativeMMIO tglEDPPanelPreAUX[tglEDPPanelSlots]{};
+static uint32_t tglEDPPanelMMIOCount{},tglEDPPanelMMIOEpochCount{};
+static uint32_t tglEDPPanelPreAUXValid{},tglEDPPanelFirstAUXEpoch{},tglEDPPanelFirstAUXSeq{};
+static uint64_t tglEDPPanelFirstAUXNS{};
+static void tglEDPPanelNativeMMIORecord(void *access,unsigned long reg,bool write,
+                                        uint32_t value,void *returnAddress,
+                                        bool diagEnabled,void *controllerAddress) {
+ if(!diagEnabled || !tglAUXLock || !access)return;
+ const int slot=tglEDPPanelRegisterSlot(reg);
+ if(slot<0)return;
+ auto controller=static_cast<uint8_t *>(controllerAddress);
+ if(!controller || *reinterpret_cast<void **>(controller+0xC40)!=access)return;
+ TGLAUXNativeMMIO receipt {};
+ uint64_t uptime;clock_get_uptime(&uptime);absolutetime_to_nanoseconds(uptime,&receipt.ns);
+ receipt.thread=reinterpret_cast<uintptr_t>(current_thread());
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ receipt.word[0]=++tglEDPPanelMMIOCount;
+ receipt.word[1]=tglEDPAUXWakeEpoch;
+ receipt.word[2]=write;
+ receipt.word[3]=static_cast<uint32_t>(reg);
+ receipt.word[4]=value;
+ receipt.word[5]=tglConnectionCaller(returnAddress);
+ receipt.word[6]=++tglEDPPanelMMIOEpochCount;
+ tglEDPPanelLatest[slot]=receipt;
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+}
+struct TGLPanelPreAUXWitness {
+ uint32_t version,epoch,auxEpoch,auxSequence,validMask,slots,itemSize,reserved;
+ uint64_t firstAuxNS;
+ TGLAUXNativeMMIO last[tglEDPPanelSlots];
+};
+static_assert(sizeof(TGLPanelPreAUXWitness)==40+48*tglEDPPanelSlots,
+              "pre-AUX panel snapshot schema");
+static bool tglEDPPanelPreAUXSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ TGLPanelPreAUXWitness witness {};
+ witness.version=1;witness.slots=tglEDPPanelSlots;witness.itemSize=sizeof(TGLAUXNativeMMIO);
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ witness.epoch=tglEDPAUXWakeEpoch;
+ witness.auxEpoch=tglEDPPanelFirstAUXEpoch;
+ witness.auxSequence=tglEDPPanelFirstAUXSeq;
+ witness.firstAuxNS=tglEDPPanelFirstAUXNS;
+ witness.validMask=tglEDPPanelPreAUXValid;
+ memcpy(witness.last,tglEDPPanelPreAUX,sizeof(witness.last));
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(&witness,sizeof(witness));
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Latest native read and write receipts for each Custom AUX register before
+// the first DDI A SEND. Keep them independently of the bulk AUX ring.
+// This is an observation of accessor receipts, not hardware acknowledgment.
+constexpr size_t tglEDPCustomAUXSlots=24;
+static int tglEDPCustomAUXSlot(unsigned long reg) {
+ if(reg&3U)return -1;
+ if(reg>=0x86338 && reg<=0x86364)return static_cast<int>((reg-0x86338)/4);
+ if(reg>=0x80040 && reg<=0x8006C)return 12+static_cast<int>((reg-0x80040)/4);
+ return -1;
+}
+static TGLAUXNativeMMIO tglEDPCustomAUXLatest[2][tglEDPCustomAUXSlots]{};
+template<size_t N> struct TGLNativePreSendWitness {
+ uint32_t version,epoch,auxEpoch,auxSequence,readMask,writeMask,slots,itemSize;
+ uint64_t firstAuxNS;
+ TGLAUXNativeMMIO last[2][N];
+};
+using TGLCustomAUXPreSendWitness=TGLNativePreSendWitness<tglEDPCustomAUXSlots>;
+static_assert(sizeof(TGLCustomAUXPreSendWitness)==40+2*24*48,
+              "Custom AUX pre-SEND receipt schema");
+template<size_t N> static bool tglEDPNativePreSendSerialize(const TGLAUXNativeMMIO (&latest)[2][N],OSSerialize *serializer) {
+ static_assert(N<=32,"receipt mask width");
+ using Witness=TGLNativePreSendWitness<N>;
+ if(!tglAUXLock)return false;
+ auto w=static_cast<Witness *>(IOMalloc(sizeof(Witness)));
+ if(!w)return false;
+ memset(w,0,sizeof(*w));
+ w->version=1;w->slots=N;w->itemSize=sizeof(TGLAUXNativeMMIO);
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ w->epoch=tglEDPAUXWakeEpoch;
+ if(w->epoch && tglEDPPanelFirstAUXEpoch==w->epoch) {
+  w->auxEpoch=tglEDPPanelFirstAUXEpoch;w->auxSequence=tglEDPPanelFirstAUXSeq;
+  w->firstAuxNS=tglEDPPanelFirstAUXNS;
+  for(size_t d=0;d<2;++d)for(size_t i=0;i<N;++i) {
+   const auto &v=latest[d][i];
+   if(v.word[0] && v.word[0]<w->auxSequence && v.word[1]==w->epoch &&
+      v.ns<=w->firstAuxNS) {
+    w->last[d][i]=v;
+    (d?w->writeMask:w->readMask)|=1U<<i;
+   }
+  }
+ }
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(w,sizeof(*w));IOFree(w,sizeof(*w));
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static bool tglEDPCustomAUXPreSendSerialize(void *,void *,OSSerialize *serializer) {
+ return tglEDPNativePreSendSerialize(tglEDPCustomAUXLatest,serializer);
+}
+// Pipe A PSR1 and DC_STATE_EN: native receipts, never implicit acknowledgment.
+constexpr size_t tglEDPLowPowerSlots=3;
+static int tglEDPLowPowerSlot(unsigned long reg) {
+ switch(reg) {
+  case 0x60800: return 0;
+  case 0x60840: return 1;
+  case 0x45504: return 2;
+  default: return -1;
+ }
+}
+static TGLAUXNativeMMIO tglEDPLowPowerLatest[2][tglEDPLowPowerSlots]{};
+using TGLLowPowerPreSendWitness=TGLNativePreSendWitness<tglEDPLowPowerSlots>;
+static_assert(sizeof(TGLLowPowerPreSendWitness)==40+2*3*48,
+              "PSR/DC pre-SEND receipt schema");
+static bool tglEDPLowPowerPreSendSerialize(void *,void *,OSSerialize *serializer) {
+ return tglEDPNativePreSendSerialize(tglEDPLowPowerLatest,serializer);
+}
+static void tglEDPAUXNativeMMIORecord(void *access, unsigned long reg, bool write,
+                                     uint32_t value, void *returnAddress,
+                                     bool diagEnabled, void *controllerAddress) {
+ // Observe only the native register transactions associated with
+ // hwConfigureCustomAUX() on Tiger Lake. setDCState() selects one of
+ // these banks using the native controller's DC configuration. This does
+ // not read MMIO, change power ownership, or infer that a write took effect.
+ // Both banks are eligible: do not bind the diagnostic to one VBT/device ID.
+ const int customSlot=tglEDPCustomAUXSlot(reg);
+ const bool customAUX=customSlot>=0;
+ const int lowPowerSlot=tglEDPLowPowerSlot(reg);
+ if(!diagEnabled || !tglAUXLock ||
+    (!customAUX && lowPowerSlot<0 && reg!=0x64010 && reg!=0x64014 &&
+     reg!=0x45444 && reg!=0x45454 &&
+     reg!=0x45404 && reg!=0x45504))return;
+ auto controller=static_cast<uint8_t *>(controllerAddress);
+ if(!controller || !access || *reinterpret_cast<void **>(controller+0xC40)!=access)return;
+ TGLAUXNativeMMIO receipt {};
+ uint64_t ticks;clock_get_uptime(&ticks);absolutetime_to_nanoseconds(ticks,&receipt.ns);
+ receipt.thread=reinterpret_cast<uintptr_t>(current_thread());
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ receipt.word[0]=++tglEDPAUXMMIOCount;
+ receipt.word[1]=tglEDPAUXWakeEpoch;
+ receipt.word[2]=write;
+ receipt.word[3]=static_cast<uint32_t>(reg);
+ receipt.word[4]=value;
+ receipt.word[5]=tglConnectionCaller(returnAddress);
+ receipt.word[6]=++tglEDPAUXMMIOEpochCount;
+ if(tglEDPAUXWakeEpoch && tglEDPPanelFirstAUXEpoch!=tglEDPAUXWakeEpoch) {
+  if(customAUX)tglEDPCustomAUXLatest[write?1:0][customSlot]=receipt;
+  if(lowPowerSlot>=0)tglEDPLowPowerLatest[write?1:0][lowPowerSlot]=receipt;
+ }
+ if(write && reg==0x64014) {
+  tglEDPAUXRecentData1[tglEDPAUXRecentData1Count%arrsize(tglEDPAUXRecentData1)]=receipt;
+  ++tglEDPAUXRecentData1Count;
+ }
+ // DATA1 (0x64014) is passively recorded before SEND, to identify the
+ // first native AUX request header without issuing any MMIO reads.
+ // The first actual AUX SEND of an epoch freezes whatever donor panel/HPD
+ // receipts already exist. Missing entries remain explicitly absent.
+ if(write && reg==0x64010 && (value&0x80000000U) &&
+    tglEDPAUXWakeEpoch && tglEDPPanelFirstAUXEpoch!=tglEDPAUXWakeEpoch) {
+  tglEDPPanelFirstAUXEpoch=tglEDPAUXWakeEpoch;
+  tglEDPAUXFirstCtl=receipt;
+  tglEDPAUXFirstData1={};
+  const size_t count=tglEDPAUXRecentData1Count<arrsize(tglEDPAUXRecentData1)
+      ? tglEDPAUXRecentData1Count:arrsize(tglEDPAUXRecentData1);
+  for(size_t i=0;i<count;++i) {
+   const auto &prior=tglEDPAUXRecentData1[
+       (tglEDPAUXRecentData1Count-1-i)%arrsize(tglEDPAUXRecentData1)];
+   if(prior.word[0] && prior.word[1]==tglEDPAUXWakeEpoch &&
+      prior.word[0]<receipt.word[0] &&
+      prior.thread==receipt.thread && prior.ns<=receipt.ns) {
+     tglEDPAUXFirstData1=prior;
+     break;
+   }
+  }
+  tglEDPPanelFirstAUXSeq=receipt.word[0];
+  tglEDPPanelFirstAUXNS=receipt.ns;
+  tglEDPPanelPreAUXValid=0;
+  for(size_t i=0;i<tglEDPPanelSlots;++i) {
+   const auto &panel=tglEDPPanelLatest[i];
+   if(panel.word[0] && panel.word[1]==tglEDPAUXWakeEpoch &&
+      panel.ns<=receipt.ns) {
+    tglEDPPanelPreAUX[i]=panel;
+    tglEDPPanelPreAUXValid|=1U<<i;
+   } else tglEDPPanelPreAUX[i]={};
+  }
+ }
+ if(receipt.word[6]<=arrsize(tglEDPAUXMMIOFirst))
+   tglEDPAUXMMIOFirst[receipt.word[6]-1]=receipt;
+ tglEDPAUXMMIOLast[(receipt.word[0]-1)%arrsize(tglEDPAUXMMIOLast)]=receipt;
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+}
+struct TGLAUXFirstCommandWitness {
+ uint32_t version,epoch,auxValid,dataValid,reserved[4];
+ TGLAUXNativeMMIO auxCtl,data1;
+};
+static_assert(sizeof(TGLAUXFirstCommandWitness)==128,
+              "sticky native first AUX command witness");
+static bool tglEDPAUXFirstCommandSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ TGLAUXFirstCommandWitness w {};
+ w.version=1;
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ w.epoch=tglEDPAUXWakeEpoch;
+ if(tglEDPAUXFirstCtl.word[0] &&
+    tglEDPAUXFirstCtl.word[1]==tglEDPAUXWakeEpoch) {
+  w.auxValid=1;w.auxCtl=tglEDPAUXFirstCtl;
+  if(tglEDPAUXFirstData1.word[0] &&
+     tglEDPAUXFirstData1.word[1]==tglEDPAUXWakeEpoch) {
+   w.dataValid=1;w.data1=tglEDPAUXFirstData1;
+  }
+ }
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(&w,sizeof(w));
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static bool tglEDPAUXNativeMMIOSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ constexpr size_t firstSize=sizeof(tglEDPAUXMMIOFirst);
+ constexpr size_t lastSize=sizeof(tglEDPAUXMMIOLast);
+ auto raw=static_cast<uint8_t *>(IOMalloc(16+firstSize+lastSize));
+ if(!raw)return false;
+ auto h=reinterpret_cast<uint32_t *>(raw);
+ h[0]=1;h[2]=64;h[3]=sizeof(TGLAUXNativeMMIO);
+ const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+ h[1]=tglEDPAUXMMIOCount;
+ memcpy(raw+16,tglEDPAUXMMIOFirst,firstSize);
+ memcpy(raw+16+firstSize,tglEDPAUXMMIOLast,lastSize);
+ IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+ auto data=OSData::withBytes(raw,16+firstSize+lastSize);
+ IOFree(raw,16+firstSize+lastSize);
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 
 static void tglComboAUXDecisionRecord(uint32_t *word) {
  if(!tglAUXLock)return;
@@ -3605,7 +3879,9 @@ static bool tglDPCDSerialize(void *, void *, OSSerialize *serializer) {
 }
 
 void tglAUXRecord(void *port, uint32_t event, bool done, uint32_t result,
-	uint32_t a, uint32_t b, uint32_t header = 0, uint32_t packet = 0) {
+	uint32_t a, uint32_t b, uint32_t header = 0, uint32_t packet = 0,
+	uint32_t extra0 = 0, uint32_t extra1 = 0, uint32_t extra2 = 0,
+	uint32_t extra3 = 0) {
 	if (!tglAUXLock || !port) return;
 	auto bytes = static_cast<uint8_t *>(port);
 	auto config = *reinterpret_cast<uint32_t **>(bytes + 0x548);
@@ -3623,15 +3899,19 @@ void tglAUXRecord(void *port, uint32_t event, bool done, uint32_t result,
 	w[7] = a; w[8] = b;
 	w[9] = *reinterpret_cast<uint32_t *>(bytes + 0x594);
 	w[24] = header; w[25] = packet;
+	if(event==14) {w[10]=extra0;w[11]=extra1;w[12]=extra2;w[13]=extra3;}
 	// This observer also runs before AUX power get and after the last put.
 	// It owns no power reference: do not read the MMIO manager or registers.
-	// Keep the 128-byte layout. [10..23]/[26] are unsampled, not zero-valued
+	// Keep the 128-byte layout. Event14 uses [10..13]; otherwise unused words are not hardware reads.
 	// hardware; [27] is the MEM1 schema marker rather than old DC_STATE_EN.
 	w[27] = 0x4D454D31;
 	IOSimpleLockLock(tglAUXLock);
 	w[0] = ++tglAUXCounts[ddi];
+ if(event==14)w[26]=tglEDPAUXWakeEpoch; // 0 is pre-wake, >0 uniquely tags a display wake
 	if (w[0] <= 256) tglAUXFirst[ddi][w[0]-1] = record;
 	tglAUXLast[ddi][(w[0]-1) % 128] = record;
+	if(event==14 && ddi==0 && done && result && !tglEDPAUXFirstFailure.word[0])
+	 tglEDPAUXFirstFailure=record;
  if(event==1 || event>=5) {
   const auto control=++tglAUXControlCounts[ddi];
   tglAUXControl[ddi][(control-1)%64]=record;
@@ -3643,6 +3923,14 @@ void tglAUXRecord(void *port, uint32_t event, bool done, uint32_t result,
 // in ring order. Existing MEM1 records carry timestamp/sequence and mode.
 // event7=provider probe, 8=mode-lock wait, 9=parent PG get/put boundary
 // (a=PG refs, b=AUX refs, header=extra refs, packet=1 get/0 put).
+// Export a memory-only first-failure receipt, never probe MMIO while serializing.
+static bool tglEDPAUXFirstFailureSerialize(void *,void *,OSSerialize *serializer) {
+ if(!tglAUXLock)return false;
+ TGLAUXRecord r {};
+ IOSimpleLockLock(tglAUXLock);r=tglEDPAUXFirstFailure;IOSimpleLockUnlock(tglAUXLock);
+ auto data=OSData::withBytes(&r,sizeof(r));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool tglAUXControlSerialize(void *,void *reference,OSSerialize *serializer) {
  const auto ddi=reinterpret_cast<uintptr_t>(reference);
  if(ddi>=9 || !tglAUXLock)return false;
@@ -3772,6 +4060,7 @@ extern "C" __attribute__((noinline, used)) void tglHostLoadSnapshot(void *owner,
  memcpy(&ptr,d+0x25,4);memcpy(&csb,d+0x29,4);
  if (sq<0x510 || (sq|load|ptr|csb)&3 || sq>tglHost.barSize-64 || load>tglHost.barSize-4 ||
   ptr>tglHost.barSize-4 || csb>tglHost.barSize-0x80) return;
+ tglS0ObserveLoad(owner,d[0],intended,before);
  const auto thread=reinterpret_cast<uintptr_t>(current_thread());
  const uint32_t wakeRegs[] {0xA188,0x130044,0xA278,0xD84,0xA540,0xD50,0xA560,0xD70};
  if (before) {
@@ -12461,7 +12750,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				const uint8_t loadBlock[] {0x48,0x8B,0x7B,0x10,0x48,0x8B,0x4B,0x28,0x48,0x8B,0x87,0x40,0x12,0x00,0x00,0x31,0xD2,0x8D,0x34,0xD5,0x00,0x00,0x00,0x00,0x03,0x71,0x19,0x8B,0x5C,0xD5,0xC0,0x89,0x1C,0x30,0x8B,0x5C,0xD5,0xC4,0x89,0x5C,0x30,0x04,0x48,0x85,0xD2,0xBA,0x01,0x00,0x00,0x00,0x74,0xDD,0x8B,0x49,0x1D,0xC7,0x04,0x08,0x01,0x00,0x00,0x00,0xF6,0x87,0x72,0x0F,0x00,0x00,0x20};
 				auto loadSite=reinterpret_cast<uint8_t *>(address+0x3AA02);
 				hostOK=hostOK && size>0x3AA47 && !memcmp(loadSite,loadBlock,sizeof(loadBlock));
-				if (hostOK) hostOK=patcher.routeMultiple(index,host,arrsize(host),address,size);
+				// Check the optional S0 ABI before the host route rewrites the IRQ entry.
+                const uint8_t s0IRQEntry[] {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+                const bool s0IRQEntryQualified=hostOK && size>=0x4A778+sizeof(s0IRQEntry) &&
+                 !memcmp(reinterpret_cast<void *>(address+0x4A778),s0IRQEntry,sizeof(s0IRQEntry));
+                if (hostOK) hostOK=patcher.routeMultiple(index,host,arrsize(host),address,size);
                 // Qualify the complete parent bank owner, its native bank0
                 // readers and service consumer before installing retry ownership.
                 if(hostOK) {
@@ -12514,7 +12807,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLHostObservationRouted",hostOK);
 				patcher.clearError();
 				if (hostOK)
-					hostOK=installTGLCSB12(patcher,index,address,size);
+					hostOK=installTGLCSB12(patcher,index,address,size,s0IRQEntryQualified);
+                if(hostOK && checkKernelArgument("-wex-tgl-s0-csb-resync"))
+                 tglS0InstallEvidence(patcher,index,address,size);
 			}
             if(adlnDetected && checkKernelArgument("-wex-adln-qtrace")) {
              const char *create="__ZN19IGAccelCommandQueue29createHardwareContextIfNeededEh";
@@ -13843,6 +14138,24 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLRetainedHook", bool(tglRetainedModeCaller));
 				patcher.clearError();
 			}
+            // Mark FB0 display wake transitions for the AUX diagnostics.
+            if (tglActive && xeProfile.family==XELP::Family::TigerLake &&
+                !display13FramebufferRequested &&
+                checkKernelArgument("-wex-tgl-edp-refdiag")) {
+                const char *symbol="__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj";
+                const uint8_t entry[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,
+                    0x53,0x50,0x41,0x89,0xF6,0x49,0x89,0xFF,0x48,0xFF,0x05,0xF1};
+                const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+                const bool known=fn==address+0x24DE8 && size>0x24DE8+sizeof(entry) &&
+                    !memcmp(reinterpret_cast<void *>(fn),entry,sizeof(entry));
+                patcher.clearError();
+                KernelPatcher::RouteRequest route(symbol,wrapTGLFramebufferWakeEpoch,orgTGLFramebufferWakeEpoch);
+                const bool diagnosticRoute=known && patcher.routeMultiple(index,&route,1,address,size);
+                patcher.clearError();
+                // Keep the status property for older diagnostic readers.
+                IORegistryEntry::getRegistryRoot()->setProperty("TGLDisplayWakePWMRouteReady",false);
+                IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPDiagWakeRouteReady",diagnosticRoute);
+            }
 
 			{
 				tglStreamLock = IOSimpleLockAlloc();
@@ -14091,7 +14404,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
             }
 			tglAUXLock = IOSimpleLockAlloc();
 			tglDisplayTraceEnabled=checkKernelArgument("-wex-display-trace");
-   tglInitTransitionTrace(tglDisplayTraceEnabled);
+   // Initialized after the eDP diagnostic gate is known; this keeps the trace memory-only.
 			if (tglConnectionLock) {
 				KernelPatcher::RouteRequest link("__ZN14AppleIntelPort15checkLinkStatusEv",
 					wrapTGLCheckLinkStatus, orgTGLCheckLinkStatus);
@@ -14149,6 +14462,13 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
 					tglAUXParentReady = patcher.routeMultiple(index, routes, arrsize(routes), address, size);
 				}
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGAUXParentPower", tglAUXParentReady);
+				// Separate explicit diagnostic. Existing AUX hooks are already
+				// installed for qualified TGL; no extra native route is needed.
+				tglEDPRefDiagRequested=tglAUXParentReady &&
+					XELP::displayAdapter(xeProfile.family)==XELP::DisplayAdapter::TGL &&
+					checkKernelArgument("-wex-tgl-edp-refdiag");
+				tglInitTransitionTrace(tglDisplayTraceEnabled);
+                IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPRefDiagReady",tglEDPRefDiagRequested);
 				patcher.clearError();
 			}
    // Resolve the base setter, never the HAL setter with fixed FIA writes.
@@ -14849,6 +15169,41 @@ void XE::wrapADLSPanelPWMEnable(void *access) {
  wrapTGLRegisterWrite(access,0xC8250,value);
 }
 
+// Start a fresh AUX diagnostic epoch before the 24H232 donor handles FB0
+// Doze-to-Wake. The donor still owns the framebuffer power transition.
+uint32_t XE::wrapTGLFramebufferWakeEpoch(IOService *fb,uint32_t requested) {
+ auto self=callbackXE;
+ // The matched native donor clamps requested states above 2 to Wake (2)
+ // before comparing its current state and dispatching the real transition.
+ if(self && self->tglEDPRefDiagRequested && fb && requested>=2 &&
+    fb->getMetaClass()->getClassSize()>=0x4B90) {
+  auto b=reinterpret_cast<const uint8_t *>(fb);
+  if(*reinterpret_cast<const uint32_t *>(b+0x1DC)==0 &&
+     *reinterpret_cast<const uint32_t *>(b+0x4284)==1 && tglAUXLock) {
+   const auto irq=IOSimpleLockLockDisableInterrupt(tglAUXLock);
+   ++tglEDPAUXWakeEpoch;
+   tglEDPAUXMMIOEpochCount=0;
+   bzero(tglEDPAUXMMIOFirst,sizeof(tglEDPAUXMMIOFirst));
+   bzero(tglEDPCustomAUXLatest,sizeof(tglEDPCustomAUXLatest));
+   bzero(tglEDPLowPowerLatest,sizeof(tglEDPLowPowerLatest));
+   tglEDPPanelMMIOEpochCount=0;
+   bzero(tglEDPPanelLatest,sizeof(tglEDPPanelLatest));
+   bzero(tglEDPPanelPreAUX,sizeof(tglEDPPanelPreAUX));
+   tglEDPPanelPreAUXValid=0;
+   tglEDPPanelFirstAUXEpoch=0;
+   tglEDPPanelFirstAUXSeq=0;
+   tglEDPPanelFirstAUXNS=0;
+   bzero(tglEDPAUXRecentData1,sizeof(tglEDPAUXRecentData1));
+   tglEDPAUXRecentData1Count=0;
+   tglEDPAUXFirstCtl={};
+   tglEDPAUXFirstData1={};
+   tglEDPAUXFirstFailure={};
+   IOSimpleLockUnlockEnableInterrupt(tglAUXLock,irq);
+  }
+ }
+ return FunctionCast(wrapTGLFramebufferWakeEpoch,self->orgTGLFramebufferWakeEpoch)(fb,requested);
+}
+
 bool XE::wrapTGLPanelPowerProperty(IORegistryEntry *framebuffer, const char *, OSObject *value) {
  if(framebuffer)return framebuffer->setProperty("AAPL,LCD-PowerState-ON",value);
  static uint32_t skipped {};
@@ -15131,6 +15486,26 @@ bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
  }
  if(auto live=OSSerializer::forTarget(nullptr,tglComboAUXDecisionSerialize)) {
   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeComboAUXDecisions",live);live->release();
+ }
+ if(callbackXE->tglEDPRefDiagRequested) {
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPAUXFirstFailureSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPAUXFirstFailure",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPAUXNativeMMIOSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPAUXNativeMMIO",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPAUXFirstCommandSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPAUXFirstCommand",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPPanelPreAUXSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPPanelPreAUX",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPCustomAUXPreSendSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPCustomAUXPreSend",live);live->release();
+  }
+  if(auto live=OSSerializer::forTarget(nullptr,tglEDPLowPowerPreSendSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeEDPLowPowerPreSend",live);live->release();
+  }
  }
  for(uintptr_t ddi=0;ddi<=8;++ddi) {
   if(ddi==2)continue; // TGL combo A/B and TC D..I; no combo C.
@@ -15908,6 +16283,8 @@ void XE::wrapTGLHostIRQClassEnable(void *bridge) {
  auto owner=*reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10);
  auto r=owner && owner==tglHost.owner ? tglFBIRQBegin(5,callbackXE->tglObservationController,
   reinterpret_cast<uintptr_t>(bridge),reinterpret_cast<uintptr_t>(__builtin_return_address(0))) : nullptr;
+ tglS0Mark(owner,TGLS0Evidence::IRQEnableEnter);
+ tglS0InvalidateIRQCandidate(bridge);
  xelpIRQStop(bridge); // Join the previous epoch before native resets its latch/masks.
  if(!xelpIRQBind(bridge)) {
   IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQReady",false);
@@ -15915,16 +16292,26 @@ void XE::wrapTGLHostIRQClassEnable(void *bridge) {
  }
  FunctionCast(wrapTGLHostIRQClassEnable,callbackXE->orgTGLHostIRQClassEnable)(bridge);
  xelpIRQStart(bridge);
+ tglS0Mark(owner,TGLS0Evidence::IRQEnableExit);
  IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQReady",xelpIRQInstalled);
  tglFBIRQEnd(r,0);
 }
+namespace {
+static void tglS0CaptureIRQDisable(void *bridge);
+}
+
 void XE::wrapTGLHostIRQClassDisable(void *bridge) {
  auto owner=*reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10);
  auto r=owner && owner==tglHost.owner ? tglFBIRQBegin(6,callbackXE->tglObservationController,
   reinterpret_cast<uintptr_t>(bridge),reinterpret_cast<uintptr_t>(__builtin_return_address(0))) : nullptr;
+ tglS0Mark(owner,TGLS0Evidence::IRQDisableEnter);
  xelpIRQStop(bridge);
  IORegistryEntry::getRegistryRoot()->setProperty("XELPVideoIRQReady",false);
+ // Share this native route with the optional S0 snapshot, after joining
+ // the video retry owner and before native IRQ shutdown.
+ tglS0CaptureIRQDisable(bridge);
  FunctionCast(wrapTGLHostIRQClassDisable,callbackXE->orgTGLHostIRQClassDisable)(bridge);
+ tglS0Mark(owner,TGLS0Evidence::IRQDisableExit);
  tglFBIRQEnd(r,0);
 }
 
@@ -15972,7 +16359,7 @@ void XE::wrapTGLHostSWInterrupt(void *streamer,void *source,int count) {
 struct TGLFatalLogStorage {
  volatile uint32_t claimed {};
  struct {
-  struct {char trail[1800],vm[1800],loads[1000];} csb;
+  struct {char trail[1800],vm[1800],loads[1000],witness[1200];} csb;
   struct {char detail[1400],boundary[1400],preStart[640];} guc;
  } bytes {};
  bool claim() {return __sync_bool_compare_and_swap(&claimed,0,1);}
@@ -16027,6 +16414,7 @@ bool tglCSB12Enabled {false};
 struct TGLCSBEngine {
  void *streamer {};
  TGLCSB::State state;
+ TGLCSB::Activity activity;
  bool hardwareReady {false};
  uint64_t consumed {}, retries {}, fallback {}, resets {}, lastRaw {};
  uint32_t modeAtInit {UINT32_MAX};
@@ -16056,9 +16444,18 @@ struct TGLCSBIO {
  }
  ~TGLCSBIO() { if (awake) tglCSBForceWake[wakeVariant](owner,false,7); }
  void acquire() { if (!awake) {tglCSBForceWake[wakeVariant](owner,true,7);awake=true;} }
- uint32_t readTail() {
-  if (!mmioTail) return sampledTail=*reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
-  acquire();return sampledTail=*reinterpret_cast<volatile uint32_t *>(bar+pointerReg)&15;
+ uint32_t readHWSPLastWrite() {
+  return *reinterpret_cast<volatile uint32_t *>(hwsp+0xBC);
+ }
+ uint32_t readMMIOPointer() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+pointerReg);
+ }
+ uint32_t readTail() { return sampledTail=TGLCSB::readTail(*this); }
+ uint32_t readMode() {
+  return *reinterpret_cast<volatile uint32_t *>(bar+modeReg);
+ }
+ void writeMode(uint32_t value) {
+  *reinterpret_cast<volatile uint32_t *>(bar+modeReg)=value;
  }
  void readFence() { __asm__ volatile("lfence" ::: "memory"); }
  uint64_t readEntry(uint32_t i) { return *reinterpret_cast<volatile uint64_t *>(hwsp+0x40+i*8); }
@@ -16082,12 +16479,226 @@ struct TGLCSBIO {
  }
 };
 
-void tglCSBInitialize(void *streamer,uint32_t flags=0) {
+
+// S0 wake experiment. Take an immutable pre-sleep snapshot *after* the
+// accelerator's native sleep preparation. The wake decision is opt-in and
+// rejects a missing snapshot or any changed software context ownership.
+struct TGLS0SleepRecord {
+ TGLCSB::WakeBaseline before {};
+ uintptr_t slots[4] {};
+ void *streamer {};
+ uint32_t epoch {},ticket {};
+ uint64_t revision {};
+};
+static TGLS0SleepRecord tglS0Sleep[6];
+static uint32_t tglS0Epoch {};
+static mach_vm_address_t tglS0OrgBridgeSystemWillSleep {};
+static bool tglS0SleepHookRouted {};
+// The bridge can already be off when native systemWillSleep arrives (live
+// witness: IRQ disable 14767 < sleep entry 14769). Capture during the actual
+// powered disable, then bind that candidate at the exact bridge sleep boundary.
+static TGLCSB::SleepCandidate tglS0Candidate;
+static uint32_t tglS0WakeTrace[6][13] {};
+static uint32_t tglS0WakeCount {};
+static TGLS0Evidence::Timeline tglS0Timeline;
+static TGLS0Evidence::Dispatch tglS0Dispatch[6];
+static bool tglS0EvidenceEnabled {};
+static uint32_t tglS0EvidenceRoutes {};
+// All fields are CPU receipts from accesses that already existed. The
+// publication word is cleared before an update and set only at its end.
+static uint64_t tglS0LoadEvidence[6][4] {};
+static uint32_t tglS0CaptureEvidence[6][6] {};
+static uint32_t tglS0ResetEvidence[6][3] {};
+static void tglS0ObserveLoad(void *owner,unsigned e,const uint64_t *intended,bool before) {
+ if(!__atomic_load_n(&tglS0EvidenceEnabled,__ATOMIC_ACQUIRE) || owner!=tglHost.owner || !intended || e>=6)return;
+ auto q=tglS0LoadEvidence[e];__atomic_store_n(q,0ULL,__ATOMIC_RELEASE);
+ __atomic_store_n(q+1,before?1ULL:2ULL,__ATOMIC_RELAXED);
+ __atomic_store_n(q+2,intended[0],__ATOMIC_RELAXED);__atomic_store_n(q+3,intended[1],__ATOMIC_RELAXED);
+ __atomic_store_n(q,tglS0Timeline.next(),__ATOMIC_RELEASE);
+}
+static bool tglS0TimelineSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t out[1+TGLS0Evidence::StageCount] {1};
+ for(unsigned i=0;i<TGLS0Evidence::StageCount;++i)out[1+i]=tglS0Timeline.at(i);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+static mach_vm_address_t tglS0OrgAccelSleep {},tglS0OrgAccelWake {},tglS0OrgPower {};
+static void tglS0Mark(void *owner,unsigned stage) {
+ if(__atomic_load_n(&tglS0EvidenceEnabled,__ATOMIC_ACQUIRE) && owner && owner==tglHost.owner)
+  tglS0Timeline.mark(stage);
+}
+static void tglS0TraceAccelSleep(void *owner) {
+ tglS0Mark(owner,TGLS0Evidence::SleepEnter);
+ reinterpret_cast<void (*)(void *)>(tglS0OrgAccelSleep)(owner);
+ tglS0Mark(owner,TGLS0Evidence::SleepExit);
+}
+static void tglS0TraceAccelWake(void *owner) {
+ tglS0Mark(owner,TGLS0Evidence::WakeEnter);
+ reinterpret_cast<void (*)(void *)>(tglS0OrgAccelWake)(owner);
+ tglS0Mark(owner,TGLS0Evidence::WakeExit);
+}
+static IOReturn tglS0TracePower(void *owner,unsigned long state,IOService *service) {
+ if(state==0)tglS0Mark(owner,TGLS0Evidence::Power0Enter);
+ if(state==2)tglS0Mark(owner,TGLS0Evidence::Power2Enter);
+ const auto result=reinterpret_cast<IOReturn (*)(void *,unsigned long,IOService *)>(tglS0OrgPower)(owner,state,service);
+ if(state==0)tglS0Mark(owner,TGLS0Evidence::Power0Exit);
+ if(state==2)tglS0Mark(owner,TGLS0Evidence::Power2Exit);
+ return result;
+}
+static void tglS0InstallEvidence(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ // Exact donor ABI: the two void callbacks and IOReturn setPowerState.
+ // Optional observation only. A failed route must not alter core admission.
+ const char *symbols[]{"__ZN16IntelAccelerator15systemWillSleepEv","__ZN16IntelAccelerator13systemDidWakeEv","__ZN16IntelAccelerator13setPowerStateEmP9IOService"};
+ const uint32_t offsets[]{0x28916,0x2897A,0x2A9B6};
+ const uint8_t shortHead[]{0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+ const uint8_t powerHead[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x49,0x89,0xF6,0x48,0x89,0xFB};
+ KernelPatcher::RouteRequest routes[]{
+  {symbols[0],tglS0TraceAccelSleep,tglS0OrgAccelSleep},
+  {symbols[1],tglS0TraceAccelWake,tglS0OrgAccelWake},
+  {symbols[2],tglS0TracePower,tglS0OrgPower}};
+ for(unsigned i=0;i<3;++i) {
+  const auto bytes=i==2?powerHead:shortHead;const auto length=i==2?sizeof(powerHead):sizeof(shortHead);
+  bool qualified=size>=offsets[i]+length && patcher.solveSymbol<mach_vm_address_t>(index,symbols[i],address,size)==address+offsets[i] &&
+   !memcmp(reinterpret_cast<void *>(address+offsets[i]),bytes,length);
+  patcher.clearError();
+  if(qualified && patcher.routeMultiple(index,&routes[i],1,address,size))tglS0EvidenceRoutes|=1U<<i;
+  patcher.clearError();
+ }
+ __atomic_store_n(&tglS0EvidenceEnabled,true,__ATOMIC_RELEASE);
+ IORegistryEntry::getRegistryRoot()->setProperty("TGLS0EvidenceRoutes",tglS0EvidenceRoutes,32);
+ if(auto trace=OSSerializer::forTarget(nullptr,tglS0TimelineSerialize)) {IORegistryEntry::getRegistryRoot()->setProperty("TGLS0LifecycleTrace",trace);trace->release();}
+}
+
+static bool tglS0CanonicalBridge(void *bridge,void *accelerator) {
+ return bridge && accelerator && accelerator==tglHost.owner &&
+  *reinterpret_cast<void **>(static_cast<uint8_t *>(accelerator)+0x1248)==bridge;
+}
+static void tglS0InvalidateIRQCandidate(void *bridge) {
+ if(!__atomic_load_n(&tglS0SleepHookRouted,__ATOMIC_ACQUIRE) || !bridge)return;
+ const auto owner=*reinterpret_cast<void **>(static_cast<uint8_t *>(bridge)+0x10);
+ if(tglS0CanonicalBridge(bridge,owner))tglS0Candidate.invalidate(reinterpret_cast<uintptr_t>(bridge));
+}
+static bool tglS0RecordUnchanged(const TGLS0SleepRecord &record,const TGLCSBEngine &engine) {
+ if(!record.before.valid || !record.streamer || engine.streamer!=record.streamer ||
+    !engine.hardwareReady || engine.state.error!=TGLCSB::Error::None ||
+    !engine.activity.stable(record.revision) || engine.state.head!=record.before.head)return false;
+ auto x=static_cast<uint8_t *>(record.streamer);
+ if(*reinterpret_cast<uint32_t *>(x+0x50)!=record.before.active ||
+    *reinterpret_cast<uint32_t *>(x+0x1C04)!=record.before.head)return false;
+ for(unsigned j=0;j<4;++j)if(record.slots[j]!=*reinterpret_cast<uintptr_t *>(x+0x30+j*8))return false;
+ return engine.activity.stable(record.revision);
+}
+static void tglS0CaptureBeforeIRQDisable(void *accelerator,uint32_t ticket) {
+ for(unsigned i=0;i<arrsize(tglS0Sleep);++i) {
+  auto &record=tglS0Sleep[i];auto &engine=tglCSBEngines[i];
+  __atomic_store_n(&record.epoch,0U,__ATOMIC_RELEASE);
+  record.ticket=0;record.before.valid=false;record.streamer=engine.streamer;
+  if(!engine.streamer || !engine.hardwareReady || engine.state.error!=TGLCSB::Error::None)continue;
+  if(*reinterpret_cast<void **>(static_cast<uint8_t *>(engine.streamer)+0x10)!=accelerator)continue;
+  const auto revision=engine.activity.version();
+  if(!engine.activity.stable(revision))continue;
+  TGLCSBIO io(engine.streamer,0);io.acquire();
+  const auto pointer=io.readMMIOPointer();const auto tail=io.readTail();const auto mode=io.readMode();
+  const auto head=engine.state.head;const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  for(unsigned j=0;j<4;++j)record.slots[j]=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8);
+  // A retained baseline is safe only with no native active/pending work and
+  // no outstanding CSB entries. Do not infer that finished stamps imply idle.
+  const bool idle=pointer!=UINT32_MAX && TGLCSB::hasCSB12Mode(mode) &&
+   head<TGLCSB::Capacity && tail==head && (pointer&0xF)==head && active<=1 &&
+   TGLCSB::emptyBanks(record.slots) && engine.activity.stable(revision) &&
+   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)==head;
+  record.before={pointer,tail,head,active,idle};record.revision=revision;record.ticket=ticket;
+  auto witness=tglS0CaptureEvidence[i];
+  __atomic_store_n(witness,0U,__ATOMIC_RELEASE);
+  __atomic_store_n(witness+1,pointer,__ATOMIC_RELAXED);__atomic_store_n(witness+2,tail,__ATOMIC_RELAXED);
+  __atomic_store_n(witness+3,head,__ATOMIC_RELAXED);__atomic_store_n(witness+4,active,__ATOMIC_RELAXED);
+  __atomic_store_n(witness+5,idle?1U:0U,__ATOMIC_RELAXED);__atomic_store_n(witness,ticket,__ATOMIC_RELEASE);
+ }
+}
+// The existing host IRQ class route is the ONLY producer. Its native original
+// obtains forcewake itself immediately afterwards. Never sample MMIO after
+// systemWillSleep returns, and never arm a foreign or already-off bridge.
+static void tglS0CaptureIRQDisable(void *bridge) {
+ if(!__atomic_load_n(&tglS0SleepHookRouted,__ATOMIC_ACQUIRE) || !bridge)return;
+ auto b=static_cast<uint8_t *>(bridge);auto owner=*reinterpret_cast<void **>(b+0x10);
+ if(!tglS0CanonicalBridge(bridge,owner) || !b[0x8A8])return;
+ const auto key=reinterpret_cast<uintptr_t>(bridge);
+ const auto ticket=tglS0Candidate.begin(key);
+ if(!ticket)return;
+ tglS0Mark(owner,TGLS0Evidence::CaptureEnter);
+ tglS0CaptureBeforeIRQDisable(owner,ticket);
+ tglS0Mark(owner,TGLS0Evidence::CaptureExit);
+ tglS0Candidate.publish(key,ticket);
+}
+static void tglS0WrapBridgeSystemWillSleep(void *bridge) {
+ const auto original=reinterpret_cast<void (*)(void *)>(tglS0OrgBridgeSystemWillSleep);
+ if(!__atomic_load_n(&tglS0SleepHookRouted,__ATOMIC_ACQUIRE) || !bridge){original(bridge);return;}
+ auto b=static_cast<uint8_t *>(bridge);auto owner=*reinterpret_cast<void **>(b+0x10);
+ if(!tglS0CanonicalBridge(bridge,owner)){original(bridge);return;}
+ tglS0Mark(owner,TGLS0Evidence::BridgeSleepEnter);
+ const auto epoch=__sync_add_and_fetch(&tglS0Epoch,1);
+ for(auto &record:tglS0Sleep)__atomic_store_n(&record.epoch,0U,__ATOMIC_RELEASE);
+ original(bridge);
+ // CPU-only adoption, whether disable ran inside this callback or earlier.
+ // The native disable sets bridge+0x8a8 to zero only after its shutdown.
+ const auto ticket=tglS0Candidate.claim(reinterpret_cast<uintptr_t>(bridge),!b[0x8A8]);
+ if(ticket) {
+  for(unsigned i=0;i<arrsize(tglS0Sleep);++i) {
+   auto &record=tglS0Sleep[i];const auto &engine=tglCSBEngines[i];
+   if(record.ticket==ticket && tglS0RecordUnchanged(record,engine))
+    __atomic_store_n(&record.epoch,epoch,__ATOMIC_RELEASE);
+  }
+  if(!tglS0Candidate.completeClaim(ticket))for(auto &record:tglS0Sleep) {
+   auto expected=epoch;
+   __atomic_compare_exchange_n(&record.epoch,&expected,0U,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+  }
+ }
+ tglS0Mark(owner,TGLS0Evidence::BridgeSleepExit);
+}
+
+// Expose a fixed CPU-only receipt through a lazy IORegistry serializer, without
+// allocating objects or updating registry properties from the sleep/wake path.
+static bool tglS0WakeTraceSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[4+6*13] {1,tglS0Epoch,tglS0WakeCount,tglS0SleepHookRouted};
+ for(unsigned i=0;i<6;++i)
+  for(unsigned j=0;j<13;++j)
+   out[4+i*13+j]=__atomic_load_n(&tglS0WakeTrace[i][j],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));
+ if(!data)return false;
+ const bool success=data->serialize(serializer);data->release();return success;
+}
+
+void tglCSBInitialize(void *streamer,uint32_t flags=0,bool verifyWakeReset=false) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ TGLCSB::ActivityScope activity(tglS0SleepHookRouted?&engine.activity:nullptr,true);
+ // Any CSB reinitialization invalidates the pre-sleep baseline. In particular,
+ // a GPU reset between systemWillSleep and resetOnWake must not reuse it.
+ __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
  // Called before the first submission, wake reset, or GPU-reset replay. Never
  // at reset's return: that method can submit GPU work before it returns.
- engine.streamer=streamer;TGLCSB::initialize(engine.state,io);
- engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+ engine.streamer=streamer;engine.hardwareReady=false;
+ io.acquire();
+ uint32_t mode=io.readMode();
+ const auto modePlan=TGLCSB::planMode(mode,engine.modeAtInit);
+ if (!TGLCSB::ensureCSB12Mode(modePlan,io,mode)) {
+  // A later submit must not bypass the GFX_MODE guard by retrying initialization.
+  engine.state.error=TGLCSB::Error::Unavailable;
+  return;
+ }
+ TGLCSB::initialize(engine.state,io);
+ if(verifyWakeReset) {
+  const auto pointer=io.readMMIOPointer(),tail=io.readHWSPLastWrite();
+  const bool matches=TGLCSB::resetMatches(pointer,tail);
+  __atomic_store_n(&tglS0ResetEvidence[io.engine][0],pointer,__ATOMIC_RELAXED);
+  __atomic_store_n(&tglS0ResetEvidence[io.engine][1],tail,__ATOMIC_RELAXED);
+  __atomic_store_n(&tglS0ResetEvidence[io.engine][2],matches?1U:2U,__ATOMIC_RELEASE);
+  if(!matches)engine.state.error=TGLCSB::Error::ResetMismatch;
+ }
+ if (engine.state.error!=TGLCSB::Error::None) {
+  engine.hardwareReady=false;
+  return;
+ }
+ engine.modeAtInit=mode;
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
 }
@@ -16113,7 +16724,7 @@ bool tglCSBSerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
-bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool s0IRQEntryQualified) {
  KernelPatcher::RouteRequest routes[] {
   {"__ZN26IGHardwareCommandStreamer54initEP22IOGraphicsAccelerator2P10IOWorkLoopP12IGScheduler510IGHwCsType",wrapTGLCSBInit,orgTGLCSBInit},
   {"__ZN26IGHardwareCommandStreamer511resetOnWakeEv",wrapTGLCSBWake,orgTGLCSBWake},
@@ -16141,69 +16752,153 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   auto p=patcher.solveSymbol<mach_vm_address_t>(index,wake[i],address,size);
   ok=ok && p==address+wakeOffsets[i];tglCSBForceWake[i]=reinterpret_cast<TGLCSBForceWake>(p);
  }
- // Both native TGL and Display13 filters can dispatch GT submission in IRQ.
- // Qualify the common counted entry before installing any CSB submission hooks.
- // Keep its native refcounts/client/ACK; do not substitute the uncounted client.
- if(ok) {
-  const uint8_t entry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
-  ok=size>0x28E19 && !memcmp(reinterpret_cast<void *>(address+0x28C2A),entry,sizeof(entry)) &&
-   *reinterpret_cast<uint8_t *>(address+0x28C9A)==0xE8 && *reinterpret_cast<uint8_t *>(address+0x28E14)==0xE9;
-  if(ok) {
-   KernelPatcher::RouteRequest protect {wake[0],xelpRegularForceWakeProtected,xelpRegularForceWakeOriginal};
-   ok=patcher.routeMultipleShort(index,&protect,1,address,size);patcher.clearError();
-  }
-  auto root=IORegistryEntry::getRegistryRoot();
-  root->setProperty("WhateverXeForceWakeIRQProtected",ok);
-  if(adlnDetected)root->setProperty("N97ForceWakeIRQProtected",ok);
-  if(ok)if(auto data=OSSerializer::forTarget(nullptr,xelpForceWakeIRQSerialize)) {
-   root->setProperty("WhateverXeForceWakeIRQ",data);data->release();
-  }
- }
- // r107: the 12-entry consumer requires the matching hardware capacity.
- // PRM vol2c printed1037 / Linux enable_execlists: GFX_MODE bit3=1.
- // Change only the native initModeRegisters store operand, before HWS setup
- // and first submission, never a live mode toggle. First qualification must
- // start from power-on reset; subsequent hardware reset uses native ordering.
+ // Validate every byte/symbol needed for the CSB12 conversion BEFORE
+ // installing hooks or mutating native code. The Lilu patcher has no
+ // per-routeMultiple rollback: an installed-but-uncommitted hook must
+ // always be able to delegate to the original six-entry native path.
  const uint8_t modeFind[] {0xC7,0x04,0x30,0x00,0x00,0x08,0x00};
  const uint8_t modeReplace[] {0xC7,0x04,0x30,0x08,0x00,0x08,0x00};
+ const uint8_t resetFind[] {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
+ const uint8_t resetReplace[] {0xB8,11,0,0,0,0x89,0x87,4,0x1C,0,0};
  auto modeSite=reinterpret_cast<uint8_t *>(address+0x28E45);
- ok=ok && patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator17initModeRegistersEv",address,size)==address+0x28E1A &&
-  !memcmp(modeSite,modeFind,sizeof(modeFind));
- if (ok) {
-  KernelPatcher::LookupPatch modePatch {currentGraphics,modeFind,modeReplace,sizeof(modeFind),1};
-  patcher.applyLookupPatch(&modePatch,modeSite,sizeof(modeFind)+1);
-  ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(modeSite,modeReplace,sizeof(modeReplace));
+ auto resetSite=reinterpret_cast<uint8_t *>(address+0x3A3A4);
+ const uint8_t wakeEntry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+ // Lilu 1.7.2 copies a whole-instruction prologue when routing. The exact
+ // reset donor has 14 bytes of pushes before the first reset-index MOV at
+ // offset +14, so patching that MOV after route does NOT modify an already
+ // copied trampoline. Reject a donor with a changed instruction boundary.
+ const uint8_t resetEntry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+ ok=ok && size>0x3CC84 &&
+   patcher.solveSymbol<mach_vm_address_t>(index,
+     "__ZN16IntelAccelerator17initModeRegistersEv",address,size)==address+0x28E1A &&
+   !memcmp(modeSite,modeFind,sizeof(modeFind)) &&
+   !memcmp(reinterpret_cast<void *>(address+0x3A396),resetEntry,sizeof(resetEntry)) &&
+   !memcmp(resetSite,resetFind,sizeof(resetFind)) &&
+   !memcmp(reinterpret_cast<void *>(address+0x28C2A),wakeEntry,sizeof(wakeEntry)) &&
+   *reinterpret_cast<uint8_t *>(address+0x28C9A)==0xE8 &&
+   *reinterpret_cast<uint8_t *>(address+0x28E14)==0xE9;
+ patcher.clearError();
+
+ // The counted ForceWake client is required by both native GT submission
+ // and the CSB12 handler. This hook forwards original refcount semantics.
+ if(ok) {
+  KernelPatcher::RouteRequest protect {wake[0],xelpRegularForceWakeProtected,xelpRegularForceWakeOriginal};
+  ok=patcher.routeMultipleShort(index,&protect,1,address,size);
+  patcher.clearError();
  }
- IORegistryEntry::getRegistryRoot()->setProperty("TGLCSB12ModePatched",ok);
- // The original reset writes head/tail itself before context replay. Keep those
- // stores but change their reset value, so it cannot undo initialize() above.
- const uint8_t find[] {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
- const uint8_t replace[] {0xB8,11,0,0,0,0x89,0x87,4,0x1C,0,0};
- auto site=reinterpret_cast<uint8_t *>(address+0x3A3A4);
- ok=ok && !memcmp(site,find,sizeof(find));patcher.clearError();
- if (ok) {
-  KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
-  patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
-  ok=!memcmp(site,replace,sizeof(replace));
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WhateverXeForceWakeIRQProtected",ok);
+ if(adlnDetected)root->setProperty("N97ForceWakeIRQProtected",ok);
+ if(ok)if(auto data=OSSerializer::forTarget(nullptr,xelpForceWakeIRQSerialize)) {
+  root->setProperty("WhateverXeForceWakeIRQ",data);data->release();
  }
- if (ok) ok=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
- auto root=IORegistryEntry::getRegistryRoot();root->setProperty("TGLCSB12Routed",ok);
- if (ok) {
+
+ // Route ALL CSB consumers first. Any partially installed hook will use its
+ // native fallback until tglCSB12Enabled is published at commit. Hardware
+ // remains in its original six-entry mode at this stage.
+ if(ok) {
+  ok=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+  patcher.clearError();
+ }
+
+ // Apply the reset-index patch first; then enable the matching GFX_MODE on
+ // the donor's original initialization path. If either fails, undo BOTH
+ // text edits, with a readback; never silently continue an inconsistent mode.
+ // Unknown donors and failures before the first text write are NOT rollback
+ // errors and must be rejected without panic.
+ bool textPatchesAttempted=false;
+ if(ok) {
+  textPatchesAttempted=true;
+  KernelPatcher::LookupPatch patch {currentGraphics,resetFind,resetReplace,sizeof(resetFind),1};
+  patcher.applyLookupPatch(&patch,resetSite,sizeof(resetFind)+1);
+  ok=patcher.getError()==KernelPatcher::Error::NoError &&
+     !memcmp(resetSite,resetReplace,sizeof(resetReplace));
+  patcher.clearError();
+ }
+ if(ok) {
+  KernelPatcher::LookupPatch patch {currentGraphics,modeFind,modeReplace,sizeof(modeFind),1};
+  patcher.applyLookupPatch(&patch,modeSite,sizeof(modeFind)+1);
+  ok=patcher.getError()==KernelPatcher::Error::NoError &&
+     !memcmp(modeSite,modeReplace,sizeof(modeReplace));
+  patcher.clearError();
+ }
+ if(!ok && textPatchesAttempted) {
+  // A successful Lilu lookup write may precede a reported error. Reverse
+  // in order. Partial/unknown byte mutations, rollback API errors or failed
+  // restoration are fatal: native six-entry code cannot run against CSB12.
+  bool rollbackOK=true;
+  if(!memcmp(modeSite,modeReplace,sizeof(modeReplace))) {
+   KernelPatcher::LookupPatch restore {currentGraphics,modeReplace,modeFind,sizeof(modeFind),1};
+   patcher.applyLookupPatch(&restore,modeSite,sizeof(modeReplace)+1);
+   rollbackOK=patcher.getError()==KernelPatcher::Error::NoError && rollbackOK;
+   patcher.clearError();
+  }
+  if(!memcmp(resetSite,resetReplace,sizeof(resetReplace))) {
+   KernelPatcher::LookupPatch restore {currentGraphics,resetReplace,resetFind,sizeof(resetFind),1};
+   patcher.applyLookupPatch(&restore,resetSite,sizeof(resetReplace)+1);
+   rollbackOK=patcher.getError()==KernelPatcher::Error::NoError && rollbackOK;
+   patcher.clearError();
+  }
+  if(!rollbackOK || memcmp(modeSite,modeFind,sizeof(modeFind)) ||
+     memcmp(resetSite,resetFind,sizeof(resetFind)))
+   PANIC("igfx","CSB12 incomplete install: unable to restore original donor code");
+ }
+ root->setProperty("TGLCSB12ModePatched",ok);
+ root->setProperty("TGLCSB12Routed",ok);
+ if(ok) {
   auto data=OSSerializer::forTarget(nullptr,tglCSBSerialize);
-  if (data) {root->setProperty("TGLCSB12Live",data);data->release();}
+  if(data) {root->setProperty("TGLCSB12Live",data);data->release();}
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
-  if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
+  if(modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
+ }
+ if (ok && checkKernelArgument("-wex-tgl-s0-csb-resync")) {
+  // Exact locally qualified donor: stopGraphicsEngine or bridge sleep can
+  // disable IRQs. Reuse the existing host IRQ route for candidate capture;
+  // bind it to systemWillSleep even when native disable is already complete.
+  // Native IRQ shutdown is still the only code mutating the interrupt state.
+  const auto sleepSymbol="__ZN17IGInterruptBridge15systemWillSleepEv";
+  const auto irqSymbol="__ZN17IGInterruptBridge17disableInterruptsEv";
+  const uint8_t entry[] {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+  bool sleepOK=s0IRQEntryQualified && orgTGLHostIRQClassDisable && size>0x4AB1D &&
+   patcher.solveSymbol<mach_vm_address_t>(index,sleepSymbol,address,size)==address+0x4AB14 &&
+   patcher.solveSymbol<mach_vm_address_t>(index,irqSymbol,address,size)==address+0x4A778 &&
+   !memcmp(reinterpret_cast<void *>(address+0x4AB14),entry,sizeof(entry));
+  patcher.clearError();
+  if(sleepOK) {
+   KernelPatcher::RouteRequest route {sleepSymbol,tglS0WrapBridgeSystemWillSleep,tglS0OrgBridgeSystemWillSleep};
+   sleepOK=patcher.routeMultiple(index,&route,1,address,size);
+   patcher.clearError();
+  }
+  __atomic_store_n(&tglS0SleepHookRouted,sleepOK,__ATOMIC_RELEASE);
+  root->setProperty("TGLS0SleepHookRouted",sleepOK);
+  if(sleepOK) {
+   auto trace=OSSerializer::forTarget(nullptr,tglS0WakeTraceSerialize);
+   if(trace) {root->setProperty("TGLS0WakeTrace",trace);trace->release();}
+  }
  }
  tglCSB12Enabled=ok;patcher.clearError();return ok;
 }
 
 bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,unsigned engine) {
  const bool ok=FunctionCast(wrapTGLCSBInit,callbackXE->orgTGLCSBInit)(streamer,owner,loop,scheduler,engine);
+ // Lilu routeMultiple can leave an earlier hook installed when a later
+ // hook fails. Until the complete CSB12 transaction commits, delegate to
+ // Apple's unmodified six-entry implementation.
+ if (!tglCSB12Enabled) return ok;
  if (ok) {
   // Streamer construction precedes graphics-engine startup. Initialize CPU
   // storage here, but defer forcewake/MMIO until the first submission or the
   // native wake-reset entry point, where that hardware access is established.
   TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  // Each native init starts a new CSB lifetime; never reuse the previous
+  // lifetime's GFX_MODE proof or sleep snapshot, even if the allocator reuses
+  // the same streamer address.
+  e.activity.change();
+  e.modeAtInit=UINT32_MAX;
+  __atomic_store_n(&tglS0Sleep[io.engine].epoch,0U,__ATOMIC_RELEASE);
+  tglS0Dispatch[io.engine].clear();
+  __atomic_store_n(tglS0LoadEvidence[io.engine],0ULL,__ATOMIC_RELEASE);
+  __atomic_store_n(tglS0CaptureEvidence[io.engine],0U,__ATOMIC_RELEASE);
   e.streamer=streamer;e.hardwareReady=false;
   io.writeTail(TGLCSB::ResetIndex);
   for (unsigned i=0;i<TGLCSB::Capacity;++i) io.writeEntry(i,TGLCSB::Sentinel);
@@ -16212,17 +16907,94 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  }
  return ok;
 }
-void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+void XE::wrapTGLCSBWake(void *streamer) {
+ if (!tglCSB12Enabled) {
+  FunctionCast(wrapTGLCSBWake,callbackXE->orgTGLCSBWake)(streamer);
+  return;
+ }
+ // The default wake policy remains CSB reinitialization; snapshot-based
+ // preservation is opt-in. Never invoke the native six-entry reset (pointer 7).
+ if (!checkKernelArgument("-wex-tgl-s0-csb-resync") || !tglS0SleepHookRouted) {
+  tglCSBInitialize(streamer);
+  return;
+ }
+ bool preserve=false,modeReady=false,verifyWakeReset=false;
+ unsigned wakeEngine=0;void *wakeOwner=nullptr;
+ {
+  TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+  wakeEngine=io.engine;wakeOwner=io.owner;verifyWakeReset=e.hardwareReady;
+  __atomic_store_n(&tglS0ResetEvidence[io.engine][2],0U,__ATOMIC_RELEASE);
+  tglS0Mark(wakeOwner,TGLS0Evidence::ResetEnter0+wakeEngine);
+  auto &snap=tglS0Sleep[io.engine];
+  const uint32_t epoch=__atomic_load_n(&snap.epoch,__ATOMIC_ACQUIRE);
+  io.acquire();
+  const uint32_t pointer=io.readMMIOPointer();
+  const uint32_t tail=io.readTail();
+  const uint32_t mode=io.readMode();
+  const uint32_t active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const auto before=(epoch && epoch==__atomic_load_n(&tglS0Epoch,__ATOMIC_ACQUIRE) &&
+      snap.streamer==streamer && tglS0RecordUnchanged(snap,e))
+      ? snap.before : TGLCSB::WakeBaseline {};
+  const auto plan=TGLCSB::planWake(before,pointer,tail,mode,e.state.head,active,e.modeAtInit);
+  auto action=plan.action;
+  uint32_t modeAfter=mode;
+  modeReady=TGLCSB::ensureCSB12Mode(plan,io,modeAfter);
+  if (!modeReady) {
+   // Never initialize a 12-entry queue unless GFX_MODE bit 3 is confirmed.
+   e.state.error=TGLCSB::Error::Unavailable;
+   e.hardwareReady=false;
+  }
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
+   for (unsigned j=0;j<4;++j)
+    if (snap.slots[j]!=*reinterpret_cast<uintptr_t *>(io.streamer+0x30+j*8)) {
+     action=TGLCSB::WakeAction::Initialize;break;
+    }
+  }
+  if (modeReady && action==TGLCSB::WakeAction::Preserve) {
+   // The existing software/native heads already match. Do NOT rewrite them:
+   // a retained idle queue must remain in its original hardware epoch.
+   if(tglS0RecordUnchanged(snap,e)) {e.modeAtInit=modeAfter;preserve=true;}
+   else action=TGLCSB::WakeAction::Initialize;
+  }
+  const uint32_t data[] {epoch,snap.before.pointer,snap.before.tail,
+   snap.before.head,snap.before.active,before.valid?1U:0U,
+   pointer,tail,mode,static_cast<uint32_t>(action),modeAfter,
+   active,e.state.head};
+  for (unsigned j=0;j<13;++j)
+   __atomic_store_n(&tglS0WakeTrace[io.engine][j],data[j],__ATOMIC_RELAXED);
+  __sync_fetch_and_add(&tglS0WakeCount,1);
+  // A subsequent reset must not reuse an earlier sleep snapshot.
+  __atomic_store_n(&snap.epoch,0U,__ATOMIC_RELEASE);
+ }
+ if (modeReady && !preserve) tglCSBInitialize(streamer,0,verifyWakeReset);
+ tglS0Mark(wakeOwner,TGLS0Evidence::ResetExit0+wakeEngine);
+}
 void XE::wrapTGLCSBReset(void *streamer) {
+ if (!tglCSB12Enabled) {
+  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+  return;
+ }
  tglCSBInitialize(streamer);
+ // Native processGPUReset may invoke submitExecList(0x80) internally.
+ // It has no mechanism to report our failed CSB12 mode initialization.
+ TGLCSBIO io(streamer,0);const auto &engine=tglCSBEngines[io.engine];
+ if (!TGLCSB::canSubmit(engine.hardwareReady,engine.state.error))
+  PANIC("igfx","CSB12 GPU reset blocked: unready e=%u error=%u",
+        io.engine,static_cast<unsigned>(engine.state.error));
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
+ if (!tglCSB12Enabled) {
+  FunctionCast(wrapTGLCSBProcess,callbackXE->orgTGLCSBProcess)(streamer,flags);
+  return;
+ }
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ TGLCSB::ActivityScope activity(tglS0SleepHookRouted?&engine.activity:nullptr);
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);
  auto consume=[&](const TGLCSB::Sample &sample) {
+  if(activity.activity)engine.activity.change();
   const auto event=TGLCSB::classify(sample.raw);const auto entry=TGLCSB::legacyEntry(event);
   engine.lastRaw=sample.raw;engine.retries+=sample.retries;
   engine.fallback+=sample.source==TGLCSB::Source::MMIO;
@@ -16258,6 +17030,21 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
   if (TGLCSB::nativeSemaphoreWait(event) &&
       (*reinterpret_cast<uint32_t *>(io.owner+0x1190)&0x18000))
    return false; // Native dependency retention is disabled; do not lose work.
+  TGLS0Evidence::Receipt witness;
+  bool witnessed=false;
+  const auto key=reinterpret_cast<uintptr_t>(&entry);
+  if(__atomic_load_n(&tglS0EvidenceEnabled,__ATOMIC_ACQUIRE) && tglHost.owner==io.owner) {
+   using namespace TGLS0Evidence;
+   auto q=witness.q;
+   q[Ordinal]=tglS0Timeline.next();q[Thread]=reinterpret_cast<uintptr_t>(current_thread());
+   q[Streamer]=reinterpret_cast<uintptr_t>(streamer);q[Raw]=sample.raw;q[Engine]=io.engine;
+   q[Index]=sample.index;q[Head]=engine.state.head;q[Tail]=io.sampledTail;
+   q[Source]=static_cast<unsigned>(sample.source);q[Retries]=sample.retries;
+   q[Flags]=entry.flags;q[Identity]=entry.identity;q[Active]=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+   memcpy(q+Slot0,io.streamer+0x30,4*sizeof(uintptr_t));q[InitMode]=engine.modeAtInit;
+   q[SnapshotEpoch]=__atomic_load_n(&tglS0Sleep[io.engine].epoch,__ATOMIC_ACQUIRE);
+   witnessed=tglS0Dispatch[io.engine].begin(key,witness);
+  }
   if (handler==2) {
    // r93 faulted at donor3C612: the second work item was null, after the
    // donor's validator had checked only the FIRST item. Keep this fatal but
@@ -16270,6 +17057,10 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    }
   }
   tglCSBMethods[handler](streamer,&entry);
+  if(witnessed) {
+   uintptr_t slots[4];memcpy(slots,io.streamer+0x30,sizeof(slots));
+   tglS0Dispatch[io.engine].complete(key,witness,*reinterpret_cast<uint32_t *>(io.streamer+0x50),slots);
+  }
   if (record) {
    // Existing fixed history: native return and resulting banks, no MMIO/wait.
    uint64_t banks[12];tglHostBanks(io.streamer,banks);
@@ -16822,6 +17613,33 @@ static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *faile
   before+=r.q[5];writes+=r.q[10];immediate+=r.q[11];finalBad+=r.q[12];
  }
  auto &trail=tglFatalLogStorage.bytes.csb.trail;size_t used=0;uint32_t kept=0;uint64_t streamer=reinterpret_cast<uintptr_t>(failedStreamer);
+ // Preserve the exact currently dispatched native entry ahead of the old boot
+ // history. Match pointer AND thread, not a guessed engine or a stale slot.
+ auto &witnessText=tglFatalLogStorage.bytes.csb.witness;
+ {
+  using namespace TGLS0Evidence;
+  Receipt receipt;bool found=false;
+  for(auto &slot:tglS0Dispatch)if(slot.find(reinterpret_cast<uintptr_t>(entry),reinterpret_cast<uintptr_t>(current_thread()),receipt)){found=true;break;}
+  if(!found)receipt={};
+  auto v=receipt.q;
+  const auto e=found?static_cast<unsigned>(v[Engine]):6U;
+  if(found)streamer=v[Streamer];
+  const auto snapEpoch=e<6?__atomic_load_n(&tglS0Sleep[e].epoch,__ATOMIC_ACQUIRE):0;
+  const auto wakeAction=e<6?__atomic_load_n(&tglS0WakeTrace[e][9],__ATOMIC_RELAXED):UINT32_MAX;
+  uint64_t load[4]{};uint32_t cap[6]{},wakeReceipt[13]{},resetReceipt[3]{};
+  if(e<6) {
+   for(unsigned i=0;i<4;++i)load[i]=__atomic_load_n(&tglS0LoadEvidence[e][i],__ATOMIC_ACQUIRE);
+   if(!load[0] || load[0]!=__atomic_load_n(tglS0LoadEvidence[e],__ATOMIC_ACQUIRE))load[0]=0;
+   for(unsigned i=0;i<6;++i)cap[i]=__atomic_load_n(&tglS0CaptureEvidence[e][i],__ATOMIC_ACQUIRE);
+   if(!cap[0] || cap[0]!=__atomic_load_n(tglS0CaptureEvidence[e],__ATOMIC_ACQUIRE))cap[0]=0;
+   for(unsigned i=0;i<13;++i)wakeReceipt[i]=__atomic_load_n(&tglS0WakeTrace[e][i],__ATOMIC_RELAXED);
+   for(unsigned i=0;i<3;++i)resetReceipt[i]=__atomic_load_n(&tglS0ResetEvidence[e][i],__ATOMIC_ACQUIRE);
+  }
+  snprintf(witnessText,sizeof(witnessText),"exact=%u seq=%llu e=%u raw=%llx index/head/tail=%llu/%llu/%llu source/retry=%llu/%llu active=%llu slots=%llx,%llx,%llx,%llx prev=%llu:%llx:%llu:%llu:%llx,%llx,%llx,%llx mode=%llx snap=%llu/%u wakeAction=%u cap=%u:%x/%u/%u/%u/%u wake=%u:%x/%u/%x/%x/%u resetRead=%x/%u/%u load=%llu:%llu:%llx,%llx routes=%x epoch=%u wakeCount=%u life=%llu/%llu,%llu/%llu,p0=%llu/%llu,p2=%llu/%llu,bridge=%llu/%llu,capture=%llu/%llu,off=%llu/%llu,on=%llu/%llu,reset=%llu/%llu",
+   found?1U:0U,v[Ordinal],e,v[Raw],v[Index],v[Head],v[Tail],v[Source],v[Retries],v[Active],v[Slot0],v[Slot1],v[Slot2],v[Slot3],v[PreviousOrdinal],v[PreviousRaw],v[PreviousIndex],v[PreviousActive],v[PreviousSlot0],v[PreviousSlot1],v[PreviousSlot2],v[PreviousSlot3],v[InitMode],v[SnapshotEpoch],snapEpoch,wakeAction,cap[0],cap[1],cap[2],cap[3],cap[4],cap[5],wakeReceipt[0],wakeReceipt[6],wakeReceipt[7],wakeReceipt[8],wakeReceipt[10],wakeReceipt[11],resetReceipt[0],resetReceipt[1],resetReceipt[2],load[0],load[1],load[2],load[3],tglS0EvidenceRoutes,
+   __atomic_load_n(&tglS0Epoch,__ATOMIC_ACQUIRE),__atomic_load_n(&tglS0WakeCount,__ATOMIC_ACQUIRE),
+   tglS0Timeline.at(SleepEnter),tglS0Timeline.at(SleepExit),tglS0Timeline.at(WakeEnter),tglS0Timeline.at(WakeExit),tglS0Timeline.at(Power0Enter),tglS0Timeline.at(Power0Exit),tglS0Timeline.at(Power2Enter),tglS0Timeline.at(Power2Exit),tglS0Timeline.at(BridgeSleepEnter),tglS0Timeline.at(BridgeSleepExit),tglS0Timeline.at(CaptureEnter),tglS0Timeline.at(CaptureExit),tglS0Timeline.at(IRQDisableEnter),tglS0Timeline.at(IRQDisableExit),tglS0Timeline.at(IRQEnableEnter),tglS0Timeline.at(IRQEnableExit),e<6?tglS0Timeline.at(ResetEnter0+e):0,e<6?tglS0Timeline.at(ResetExit0+e):0);
+ }
  // Locate this failure's streamer, then retain its history across interrupt
  // threads. Fixed records are read only here, after the native fatal decision.
  for (uint32_t i=tglHost.csbs<arrsize(tglHost.csb) ? tglHost.csbs : arrsize(tglHost.csb);i && kept<6;--i) {
@@ -16876,8 +17694,8 @@ static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *faile
   const auto &s=tglHost.submit[i-1];
   if (__atomic_load_n(&s.ready,__ATOMIC_ACQUIRE) && s.q[1]==streamer && s.q[47]==97) {wake=s.q;break;}
  }
- PANIC("igfx","r113 %s entry=%x:%x maps=%u before=%llu writes=%llu immediateBad=%llu finalBad=%llu submits=%u waits=%u csbs=%u loads=%u irq=%u,%u,%u firstContextBad=%llu,%llu firstHWSBad=%llu wakeRefs=%llu/%llu/%llu lastLoadValid=%u lastHWS=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx lastMMIO=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx trail(newest)=%s preLOAD(newest)=%s VM(firstLOAD)=%s",
-  reason,entry ? entry[1] : 0,entry ? entry[0] : 0,tglHost.maps,before,writes,immediate,finalBad,
+ PANIC("igfx","r113 %s entry=%x:%x live={%s} maps=%u before=%llu writes=%llu immediateBad=%llu finalBad=%llu submits=%u waits=%u csbs=%u loads=%u irq=%u,%u,%u firstContextBad=%llu,%llu firstHWSBad=%llu wakeRefs=%llu/%llu/%llu lastLoadValid=%u lastHWS=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx lastMMIO=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx trail(early)=%s preLOAD(early)=%s VM(firstLOAD)=%s",
+  reason,entry ? entry[1] : 0,entry ? entry[0] : 0,witnessText,tglHost.maps,before,writes,immediate,finalBad,
   tglHost.submits,tglHost.waits,tglHost.csbs,tglHost.loads,tglHost.irqCount[0],tglHost.irqCount[1],tglHost.irqCount[2],submitted ? submit.q[28] : UINT64_MAX,
   submitted ? submit.q[35] : UINT64_MAX,submitted ? submit.q[42] : UINT64_MAX,
   wake ? wake[48] : UINT64_MAX,wake ? wake[49] : UINT64_MAX,wake ? wake[114] : UINT64_MAX,latestLoad!=nullptr,
@@ -16926,10 +17744,21 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    PANIC("igfx","AlderLakeN native request rejected: standalone IRQ source is not enabled");
  }
  uint8_t *renderWakeOwner=nullptr;
+ TGLCSB::ActivityScope activity;
  if (tglCSB12Enabled) {
   TGLCSBIO io(streamer,flags);auto &e=tglCSBEngines[io.engine];
+  if(tglS0SleepHookRouted)activity.enter(&e.activity,true);
   if (e.streamer!=streamer) PANIC("igfx","CSB12 submission before native init");
-  if (!e.hardwareReady) tglCSBInitialize(streamer,flags);
+  // A failed resume pointer proof must not be hidden by another destructive
+  // queue init during submit. Only the separate native GPU reset may recover.
+  if (!e.hardwareReady && e.state.error!=TGLCSB::Error::ResetMismatch) tglCSBInitialize(streamer,flags);
+  // Native submitExecList is void and unconditionally updates scheduler and
+  // HW work.  A failed 12-entry mode re-arm must never reach that path.
+  // There is no verified completion/error callback at this boundary; do not
+  // silently discard pending stamps or fabricate successful GPU execution.
+  if (!TGLCSB::canSubmit(e.hardwareReady,e.state.error))
+   PANIC("igfx","CSB12 submit blocked: mode/queue unready e=%u error=%u",
+         io.engine,static_cast<unsigned>(e.state.error));
   uint64_t nativeFlags;memcpy(&nativeFlags,io.owner+0x1190,sizeof(nativeFlags));
   // Gen12 RCS SQ/LOAD require render forcewake. Use the same refcounted API
   // as native submitExecList (3A878/3AA50), independently of flags40. The
@@ -18098,8 +18927,16 @@ void XE::wrapTGLEnableAUXPower(void *power, uint32_t ddi) {
 	if (self->tglAUXParentEligible(ddi) && !self->tglAUXParentOwner)
 		self->tglAUXParentOwner = power;
 	const bool hold = self->tglAUXParentEligible(ddi) && self->tglAUXParentOwner == power;
-	void *port = hold ? reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
+	const bool trace=self->tglEDPRefDiagRequested && ddi==0 && power && self->tglPortByDDI;
+	void *port = (hold || trace) && self->tglPortByDDI ?
+		reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
 	auto bytes = static_cast<uint8_t *>(power);
+	// Event 12: native AUX get entry/return, independent of parent-PG gate.
+	// a=native AUX refs, b=native DDI refs, header=extra PG refs, packet=suspend.
+	if(trace && port)tglAUXRecord(port,12,false,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) {
 		tglAUXRecord(port, 5, false, 0, *reinterpret_cast<uint32_t *>(bytes + 0x28), *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi), self->tglAUXParentRefs[ddi]);
 		reinterpret_cast<void (*)(void *, uint32_t)>(self->tglEnablePG)(power, self->tglAUXParentPG(ddi));
@@ -18108,13 +18945,19 @@ void XE::wrapTGLEnableAUXPower(void *power, uint32_t ddi) {
 		++self->tglAUXParentRefs[ddi];
 	}
 	FunctionCast(wrapTGLEnableAUXPower, self->orgTGLEnableAUXPower)(power, ddi);
+	if(trace && port)tglAUXRecord(port,12,true,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) tglAUXRecord(port, 5, true, 0, *reinterpret_cast<uint32_t *>(bytes + 0x28), *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi), self->tglAUXParentRefs[ddi]);
 }
 
 void XE::wrapTGLDisableAUXPower(void *power, uint32_t ddi) {
 	auto self = callbackXE;
 	const bool hold = self->tglAUXParentEligible(ddi);
-	void *port = hold ? reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
+	const bool trace=self->tglEDPRefDiagRequested && ddi==0 && power && self->tglPortByDDI;
+	void *port = (hold || trace) && self->tglPortByDDI ?
+		reinterpret_cast<void *(*)(uint32_t)>(self->tglPortByDDI)(ddi) : nullptr;
 	auto bytes = static_cast<uint8_t *>(power);
 	// EFI refs have no matching extra PG ref. Consume those first, including
 	// when inherited and owned refs coexist. Keep our PG refs until the last
@@ -18122,8 +18965,16 @@ void XE::wrapTGLDisableAUXPower(void *power, uint32_t ddi) {
 	const auto nativeRefs = hold ? *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi) : 0;
 	const bool release = hold && self->tglAUXParentOwner == power && self->tglAUXParentRefs[ddi] != 0 &&
 		nativeRefs != 0 && nativeRefs <= self->tglAUXParentRefs[ddi];
+	if(trace && port)tglAUXRecord(port,13,false,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) tglAUXRecord(port, 6, false, 0, *reinterpret_cast<uint32_t *>(bytes + 0x28), *reinterpret_cast<uint32_t *>(bytes + 0x54 + 4 * ddi), self->tglAUXParentRefs[ddi]);
 	FunctionCast(wrapTGLDisableAUXPower, self->orgTGLDisableAUXPower)(power, ddi);
+	if(trace && port)tglAUXRecord(port,13,true,0,
+		*reinterpret_cast<uint32_t *>(bytes+0x54+4*ddi),
+		*reinterpret_cast<uint32_t *>(bytes+0x30+4*ddi),
+		self->tglAUXParentRefs[ddi],bytes[0x18]);
 	if (hold) {
 		if (release) {
 			--self->tglAUXParentRefs[ddi];
@@ -18136,11 +18987,33 @@ void XE::wrapTGLDisableAUXPower(void *power, uint32_t ddi) {
 }
 
 uint32_t XE::wrapTGLRunAUX(void *port, uint32_t command, uint32_t *packet, uint32_t length, bool flag) {
+ // Software-only boundary receipts. No additional MMIO or power references:
+ // the real donor AUX_CTL and ACK values are captured by the original
+ // ReadRegister32/WriteRegister32 intercepts INSIDE native lock ownership.
+ auto witness = [&](bool done, uint32_t result) {
+  auto self=callbackXE;
+  if(!self || !self->tglEDPRefDiagRequested || !self->tglActive ||
+     !self->tglObservationController || !port)return;
+  auto p=static_cast<uint8_t *>(port);
+  auto cfg=*reinterpret_cast<uint32_t **>(p+0x548);
+  if(!cfg || cfg[0]!=0)return;
+  auto controller=static_cast<uint8_t *>(self->tglObservationController);
+  auto power=*reinterpret_cast<uint8_t **>(controller+0xC8);
+  uint32_t nativeAux=UINT32_MAX,nativeDDI=UINT32_MAX;
+  if(power && *reinterpret_cast<void **>(power+0x10)==controller) {
+   nativeAux=*reinterpret_cast<uint32_t *>(power+0x54);
+   nativeDDI=*reinterpret_cast<uint32_t *>(power+0x30);
+  }
+  tglAUXRecord(port,14,done,result,UINT32_MAX,UINT32_MAX,
+               UINT32_MAX,UINT32_MAX,nativeAux,nativeDDI,cfg[2],cfg[3]);
+ };
 	const auto header = packet && length >= 4 ? packet[0] : 0;
 	const uint32_t args = length | (static_cast<uint32_t>(flag) << 16);
+	witness(false,0);
 	tglAUXRecord(port, 0, false, 0, command, args, header, header);
 	const auto result = FunctionCast(wrapTGLRunAUX, callbackXE->orgTGLRunAUX)(port, command, packet, length, flag);
 	tglAUXRecord(port, 0, true, result, command, args, header, packet && length >= 4 ? packet[0] : 0);
+	witness(true,result);
 	return result;
 }
 
@@ -18386,6 +19259,8 @@ uint32_t XE::wrapTGLRegisterRead(void *access, unsigned long reg) {
  const bool trace=tglTransitionRegister(reg);
  if(trace)tglTransitionRecord(35,false,access,reg,tglConnectionCaller(__builtin_return_address(0)),0);
 	auto value = FunctionCast(wrapTGLRegisterRead, callbackXE->orgTGLRegisterRead)(access, reg);
+ tglEDPAUXNativeMMIORecord(access,reg,false,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
+ tglEDPPanelNativeMMIORecord(access,reg,false,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
  if(trace)tglTransitionRecord(35,true,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
 	const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 	auto s = callbackXE;
@@ -20655,6 +21530,8 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 		reinterpret_cast<uintptr_t>(__builtin_return_address(0))) : nullptr;
  const bool trace=tglTransitionRegister(reg);
  if(trace)tglTransitionRecord(36,false,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
+	tglEDPAUXNativeMMIORecord(access,reg,true,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
+	tglEDPPanelNativeMMIORecord(access,reg,true,value,__builtin_return_address(0),callbackXE->tglEDPRefDiagRequested,callbackXE->tglObservationController);
 	FunctionCast(wrapTGLRegisterWrite, callbackXE->orgTGLRegisterWrite)(access, reg, value);
  // Sample PWM only at a native duty write while its caller owns power.
  // IORegistry reads consume this receipt; they never touch live MMIO.

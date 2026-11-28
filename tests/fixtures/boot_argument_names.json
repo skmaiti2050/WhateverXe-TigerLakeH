@@ -150,5 +150,7 @@
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
-  "-wex-skip-gputicks": []
+  "-wex-skip-gputicks": [],
+  "-wex-tgl-s0-csb-resync": [],
+  "-wex-tgl-edp-refdiag": ["-wex-tgl-displaywake-pwm"]
 }
